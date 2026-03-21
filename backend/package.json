@@ -1,0 +1,10 @@
+{
+  "name": "negotiation-platform-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --experimental-strip-types src/server.ts",
+    "start": "node --experimental-strip-types src/server.ts",
+    "test": "node --test --experimental-strip-types src/tests/*.test.ts"
+  }
+}
