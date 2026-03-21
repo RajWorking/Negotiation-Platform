@@ -5,10 +5,11 @@ import unittest
 from pathlib import Path
 
 from python_backend.app.agents import PracticeAgent
+from python_backend.app.analysis_orchestrator import SemanticAnalysisOrchestrator
 from python_backend.app.document_ingestion import DocumentIngestionService
 from python_backend.app.hf_client import HuggingFaceChatClient
 from python_backend.app.orchestrator import SessionOrchestrator
-from python_backend.app.schemas import CreateSessionRequest, VoiceProfile
+from python_backend.app.schemas import ConversationTurn, CreateSessionRequest, VoiceProfile
 from python_backend.app.storage import SessionStore
 
 
@@ -86,6 +87,27 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rewind["status"], "restored")
         self.assertGreater(len(rewind["session"].archived_turns), 0)
 
+    async def test_semantic_key_moments_are_detected(self) -> None:
+        session = self.orchestrator.create_session(
+            CreateSessionRequest(
+                situation_description="Negotiate rent with a difficult landlord",
+                partner_tone="landlord",
+                voice_profile=VoiceProfile(),
+                mode="balanced",
+                coaching_focuses=[],
+            )
+        )
+        self.orchestrator.start(session.session_id)
+        await self.orchestrator.finalize_user_transcript(
+            session.session_id,
+            "Based on comparable units, I want to propose $1900 as the right rent.",
+        )
+        saved = self.store.get(session.session_id)
+        self.assertIsNotNone(saved)
+        kinds = [moment.kind for moment in saved.key_moments]
+        self.assertIn("first_anchor", kinds)
+        self.assertIn("strong_pushback", kinds)
+
     async def test_practice_agent_rejects_instruction_leakage(self) -> None:
         class FakeHFClient:
             async def chat_completion(self, **_: object) -> str:
@@ -103,6 +125,70 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             turns=[{"speaker": "user", "transcript": "I want to discuss compensation."}],
         )
         self.assertNotIn("Return only JSON", payload["reply_text"])
+        self.assertNotIn("Push back where needed, but remain fair", payload["reply_text"])
+        self.assertNotIn("I hear your point.", payload["reply_text"])
+
+    async def test_llm_analysis_orchestrator_can_produce_semantic_moments(self) -> None:
+        class FakeHFClient:
+            token = "fake-token"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_completion(self, **_: object) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        '{"summary":"The user anchors and the partner pushes back.",'
+                        '"signals":['
+                        '{"turn_id":"turn_user","signal_type":"anchor","intensity":0.91,"evidence":"$1900","rationale":"Concrete anchor."},'
+                        '{"turn_id":"turn_agent","signal_type":"pushback","intensity":0.88,"evidence":"need a stronger justification","rationale":"Direct resistance."}'
+                        "]}"
+                    )
+                return (
+                    '{"key_moments":['
+                    '{"kind":"first_anchor","label":"First Anchor","turn_id":"turn_user","summary":"User anchors at $1900."},'
+                    '{"kind":"strong_pushback","label":"Strong Pushback","turn_id":"turn_agent","summary":"Agent demands stronger justification."}'
+                    "]}"
+                )
+
+            @staticmethod
+            def parse_json_object(raw_text: str) -> dict[str, object]:
+                import json
+                return json.loads(raw_text)
+
+        analyzer = SemanticAnalysisOrchestrator(FakeHFClient())  # type: ignore[arg-type]
+        turns = [
+            ConversationTurn(
+                turnId="turn_user",
+                sessionId="sess_test",
+                speaker="user",
+                transcript="Based on comparable units, I want to propose $1900.",
+                startedAt="2025-01-01T00:00:00+00:00",
+                endedAt="2025-01-01T00:00:01+00:00",
+            ),
+            ConversationTurn(
+                turnId="turn_agent",
+                sessionId="sess_test",
+                speaker="agent",
+                transcript="You made a concrete ask, but I still need a stronger justification.",
+                startedAt="2025-01-01T00:00:02+00:00",
+                endedAt="2025-01-01T00:00:03+00:00",
+            ),
+        ]
+        analysis = await analyzer.analyze(
+            session_id="sess_test",
+            scenario="Negotiate rent",
+            partner_tone="landlord",
+            routing={"mode": "balanced", "chat_model": "fake", "context_window": 4},
+            turns=turns,
+            fallback_key_moments=[],
+            heuristic_features={},
+        )
+        kinds = [moment.kind for moment in analysis["key_moments"]]
+        self.assertEqual(analysis["source"], "llm_multi_pass")
+        self.assertIn("first_anchor", kinds)
+        self.assertIn("strong_pushback", kinds)
 
 
 if __name__ == "__main__":

@@ -17,8 +17,8 @@ import { ScrollArea } from "./ui/scroll-area";
 import { motion, AnimatePresence } from "motion/react";
 import { clearActiveSession, loadActiveSession } from "../lib/storage";
 import { createSpeechRecognition, speakWithBrowserVoice, stopSpeaking } from "../lib/speech";
-import { endSession, getCheckpoints, getSessionState, pauseSession, requestCoaching, resumeSession, websocketUrl } from "../lib/api";
-import type { CheckpointSummary, CoachingReportResponse, SessionStateResponse, TranscriptTurn } from "../lib/types";
+import { endSession, getSessionState, pauseSession, requestCoaching, resumeSession, websocketUrl } from "../lib/api";
+import type { CoachingReportResponse, KeyMoment, SessionStateResponse, TranscriptTurn } from "../lib/types";
 
 interface TranscriptMessage {
   id: string;
@@ -57,7 +57,7 @@ export function LiveSimulation() {
   const [elapsedTime, setElapsedTime] = useState(0);
   const [showCoaching, setShowCoaching] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
-  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
+  const [keyMoments, setKeyMoments] = useState<KeyMoment[]>([]);
   const [currentSpeaker, setCurrentSpeaker] = useState<"user" | "ai" | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionUiStatus>("connecting");
   const [coachingReport, setCoachingReport] = useState<CoachingReportResponse | null>(null);
@@ -123,15 +123,11 @@ export function LiveSimulation() {
 
     const connectSession = async () => {
       try {
-        const [state, checkpointList] = await Promise.all([
-          getSessionState(sessionId),
-          getCheckpoints(sessionId),
-        ]);
+        const state = await getSessionState(sessionId);
         if (cancelled) {
           return;
         }
         applySessionState(state);
-        setCheckpoints(checkpointList);
         await connectWebSocket(sessionId);
         if (state.status !== "paused" && state.status !== "ended" && state.liveState.currentSpeaker !== "agent") {
           await startInputLoop();
@@ -156,7 +152,7 @@ export function LiveSimulation() {
 
   const applySessionState = (state: SessionStateResponse) => {
     setTranscript(state.turns.map(toTranscriptMessage));
-    setCheckpoints(state.checkpoints);
+    setKeyMoments(state.keyMoments);
     setPartialTranscript(state.liveState.partialTranscript ?? "");
     const mappedSpeaker = state.liveState.currentSpeaker === "agent" ? "ai" : state.liveState.currentSpeaker;
     setCurrentSpeaker(mappedSpeaker);
@@ -169,19 +165,19 @@ export function LiveSimulation() {
     }
   };
 
-  const keyMomentEntries = checkpoints
-    .map((checkpoint, index) => {
-      const targetMessage = transcript[checkpoint.turnIndex - 1];
+  const keyMomentEntries = keyMoments
+    .map((moment, index) => {
+      const targetMessage = transcript.find((message) => message.id === moment.turnId);
       if (!targetMessage) {
         return null;
       }
       return {
-        checkpoint,
+        moment,
         index,
         messageId: targetMessage.id,
       };
     })
-    .filter((entry): entry is { checkpoint: CheckpointSummary; index: number; messageId: string } => Boolean(entry));
+    .filter((entry): entry is { moment: KeyMoment; index: number; messageId: string } => Boolean(entry));
 
   const scrollToMessage = (messageId: string) => {
     const element = document.getElementById(messageId);
@@ -256,15 +252,13 @@ export function LiveSimulation() {
           return;
         }
         if (data.type === "session.checkpoint.created" && data.checkpoint) {
-          setCheckpoints((prev) => {
+          return;
+        }
+        if (data.type === "session.key_moment.created" && data.key_moment) {
+          setKeyMoments((prev) => {
             const next = [
-              ...prev.filter((item) => item.checkpointId !== data.checkpoint.checkpointId),
-              {
-                checkpointId: data.checkpoint.checkpointId,
-                turnIndex: data.checkpoint.turnIndex,
-                summary: data.checkpoint.summary,
-                createdAt: data.checkpoint.createdAt,
-              },
+              ...prev.filter((item) => item.keyMomentId !== data.key_moment.keyMomentId && item.kind !== data.key_moment.kind),
+              data.key_moment as KeyMoment,
             ];
             return next.sort((left, right) => left.turnIndex - right.turnIndex);
           });
@@ -544,9 +538,9 @@ export function LiveSimulation() {
           </div>
           <ScrollArea className="flex-1 p-4">
             <div className="space-y-2">
-              {keyMomentEntries.map(({ checkpoint, index, messageId }) => (
+              {keyMomentEntries.map(({ moment, index, messageId }) => (
                 <button
-                  key={checkpoint.checkpointId}
+                  key={moment.keyMomentId}
                   onClick={() => scrollToMessage(messageId)}
                   className="w-full text-left px-4 py-3 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 hover:border-slate-300 transition-all group"
                 >
@@ -556,13 +550,13 @@ export function LiveSimulation() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium text-slate-800 mb-1">
-                        Turn {checkpoint.turnIndex}
+                        {moment.label}
                       </div>
                       <div className="text-xs text-slate-500 mb-1">
-                        {checkpoint.summary}
+                        {moment.summary}
                       </div>
                       <div className="text-xs text-slate-500 font-mono">
-                        {getCheckpointTimestamp(checkpoint.createdAt)}
+                        {getCheckpointTimestamp(moment.createdAt)}
                       </div>
                     </div>
                   </div>

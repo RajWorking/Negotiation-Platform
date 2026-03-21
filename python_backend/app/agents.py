@@ -37,10 +37,74 @@ def _is_instruction_leak(text: str) -> bool:
     return False
 
 
+def _fallback_reply_body(intent: str, last_user_turn: str, situation_description: str, mode: str) -> str:
+    concise = mode == "fast"
+    strategic = mode == "quality"
+    body = summarize_text(last_user_turn, 120)
+
+    if intent == "counter":
+        if concise:
+            return "That number is clearer, but I still need a better reason to move."
+        if strategic:
+            return (
+                "You put a concrete number on the table, but I still need a tighter case for why that number fits "
+                "the constraints here and why I should move off my current position."
+            )
+        return "You made a concrete ask, but I still need a stronger justification for why that number works here."
+
+    if intent == "question":
+        if concise:
+            return "I can answer that, but first I need a clearer statement of what you actually want."
+        if strategic:
+            return (
+                "I can answer that, but I need you to sharpen the objective first. Be explicit about the outcome you "
+                "want and why it makes sense from my side."
+            )
+        return "I can address that, but I still need a clearer statement of the outcome you want here."
+
+    if intent == "justify":
+        if concise:
+            return "I hear the reasoning, but it still feels incomplete from my side."
+        if strategic:
+            return (
+                "Your reasoning is better, but it still does not close the gap for me. Tie it to concrete impact, "
+                "risk reduction, or market reality so I can justify moving."
+            )
+        return "I hear the logic, but I still need a stronger justification before I change position."
+
+    if re.search(r"salary|offer|compensation|pay", situation_description, re.IGNORECASE):
+        if concise:
+            return "I’m open to the compensation discussion, but I need a stronger case than that."
+        if strategic:
+            return (
+                "I’m open to discussing compensation, but I need a tighter argument around scope, impact, and market "
+                "evidence before I can move meaningfully."
+            )
+        return "I’m open to discussing compensation, but I need a stronger case than that."
+
+    if re.search(r"rent|lease|landlord|tenant", situation_description, re.IGNORECASE):
+        if concise:
+            return "I understand the ask, but I’m not ready to change the rent based on that alone."
+        if strategic:
+            return (
+                "I understand what you are asking for, but I still need a more concrete case around market evidence, "
+                "property tradeoffs, and why changing the current terms makes sense."
+            )
+        return "I understand your position, but I’m not ready to change the current terms based on that alone."
+
+    if concise:
+        return f"I understand your point, but I’m not ready to move based on {body}."
+    if strategic:
+        return (
+            "I understand where you are trying to take this conversation, but I’m not convinced yet. "
+            "If you want movement from me, make the next point more concrete and more valuable from my perspective."
+        )
+    return "I understand your position, but I’m not persuaded enough to change mine yet."
+
+
 def _fallback_practice_reply(persona: dict[str, object], last_user_turn: str) -> dict[str, object]:
     intent = _detect_intent(last_user_turn)
-    body = summarize_text(last_user_turn, 120)
-    reply_text = f"{persona['opener']} {persona['challenge_style']} I need a stronger case than: {body}"
+    reply_text = "I understand your point, but I need a stronger case."
     return {
         "reply_text": reply_text,
         "emotion_tags": list(persona["style_tags"]),
@@ -101,7 +165,14 @@ class PracticeAgent:
         if parsed and isinstance(parsed.get("reply_text"), str) and not _is_instruction_leak(str(parsed["reply_text"])):
             return parsed
 
-        return _fallback_practice_reply(persona, last_user_turn)
+        fallback = _fallback_practice_reply(persona, last_user_turn)
+        fallback["reply_text"] = _fallback_reply_body(
+            fallback["intent"],
+            last_user_turn,
+            str(config["situation_description"]),
+            str(routing["mode"]),
+        )
+        return fallback
 
 
 class CoachingAgent:
@@ -116,6 +187,8 @@ class CoachingAgent:
         routing: dict[str, object],
         recent_turns: list[dict[str, object]],
         features: dict[str, object],
+        semantic_analysis: dict[str, object],
+        key_moments: list[dict[str, object]],
         retrieved: list[dict[str, object]],
     ) -> dict[str, object]:
         recent_text = "\n".join(f"{turn['speaker']}: {turn['transcript']}" for turn in recent_turns)
@@ -135,6 +208,8 @@ class CoachingAgent:
                     f"Coaching focuses: {', '.join(config.get('coaching_focuses', [])) or 'general'}\n"
                     f"Recent turns:\n{recent_text}\n"
                     f"Features: {features}\n"
+                    f"Semantic analysis: {semantic_analysis}\n"
+                    f"Key moments: {key_moments}\n"
                     f"Retrieved evidence:\n{evidence or 'none'}"
                 ),
             },

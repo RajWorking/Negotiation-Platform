@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Optional
 
 from .agents import CoachingAgent, PracticeAgent
+from .analysis_orchestrator import SemanticAnalysisOrchestrator
 from .document_ingestion import DocumentIngestionService
 from .feature_extraction import extract_features
 from .hf_client import HuggingFaceChatClient
+from .key_moment_detector import detect_key_moments
 from .model_router import route_mode
 from .schemas import (
     BehavioralFeatures,
@@ -37,6 +39,7 @@ class SessionOrchestrator:
         self.audio_dir = audio_dir
         self.practice_agent = PracticeAgent(hf_client)
         self.coaching_agent = CoachingAgent(hf_client)
+        self.semantic_analysis = SemanticAnalysisOrchestrator(hf_client)
 
     def _require_session(self, session_id: str) -> SessionState:
         session = self.store.get(session_id)
@@ -61,9 +64,11 @@ class SessionOrchestrator:
             ),
             turns=[],
             checkpoints=[],
+            keyMoments=[],
             reports=[],
             documentChunks=[],
             features=BehavioralFeatures(),
+            semanticAnalysis={},
             archivedTurns=[],
             liveState=LiveState(lastUpdatedAt=created_at),
             createdAt=created_at,
@@ -148,7 +153,7 @@ class SessionOrchestrator:
     async def finalize_user_transcript(self, session_id: str, text: str) -> dict[str, object]:
         session = self._require_session(session_id)
         if session.status in {"paused", "ended"}:
-            return {"session": session, "user_turn": None, "agent_turn": None, "checkpoint": None}
+            return {"session": session, "user_turn": None, "agent_turn": None, "checkpoint": None, "key_moments_created": []}
 
         routing = route_mode(session.config.mode)
         user_turn = ConversationTurn(
@@ -188,6 +193,24 @@ class SessionOrchestrator:
         session.live_state.turn_index = len(session.turns)
         session.live_state.current_speaker = "user"
         session.features = extract_features(session.turns)
+        previous_kinds = {moment.kind for moment in session.key_moments}
+        fallback_key_moments = detect_key_moments(session_id, session.turns)
+        semantic_analysis = await self.semantic_analysis.analyze(
+            session_id=session_id,
+            scenario=session.config.situation_description,
+            partner_tone=session.config.partner_tone,
+            routing=routing,
+            turns=session.turns,
+            fallback_key_moments=fallback_key_moments,
+            heuristic_features=session.features.model_dump(mode="json", by_alias=False),
+        )
+        session.semantic_analysis = {
+            "signals": semantic_analysis.get("signals", []),
+            "summary": semantic_analysis.get("summary", ""),
+            "source": semantic_analysis.get("source", "heuristic_fallback"),
+        }
+        session.key_moments = semantic_analysis.get("key_moments", fallback_key_moments)
+        key_moments_created = [moment for moment in session.key_moments if moment.kind not in previous_kinds]
 
         checkpoint = Checkpoint(
             checkpointId=make_id("ckpt"),
@@ -206,7 +229,13 @@ class SessionOrchestrator:
         session.live_state.last_checkpoint_id = checkpoint.checkpoint_id
         session.updated_at = now_iso()
         self.store.save(session)
-        return {"session": session, "user_turn": user_turn, "agent_turn": agent_turn, "checkpoint": checkpoint}
+        return {
+            "session": session,
+            "user_turn": user_turn,
+            "agent_turn": agent_turn,
+            "checkpoint": checkpoint,
+            "key_moments_created": key_moments_created,
+        }
 
     async def coach(self, session_id: str, window_turns: int) -> CoachingReport:
         session = self._require_session(session_id)
@@ -231,6 +260,8 @@ class SessionOrchestrator:
             routing=routing,
             recent_turns=[turn.model_dump(mode="json", by_alias=False) for turn in recent_turns],
             features=session.features.model_dump(mode="json", by_alias=False),
+            semantic_analysis=session.semantic_analysis,
+            key_moments=[moment.model_dump(mode="json", by_alias=False) for moment in session.key_moments],
             retrieved=retrieved,
         )
         report = CoachingReport(
@@ -263,6 +294,12 @@ class SessionOrchestrator:
         session.live_state.partial_transcript = ""
         session.status = "live"
         session.features = extract_features(session.turns)
+        session.key_moments = detect_key_moments(session_id, session.turns)
+        session.semantic_analysis = {
+            "signals": [],
+            "summary": "",
+            "source": "reset_after_rewind",
+        }
         session.updated_at = now_iso()
         self.store.save(session)
         return {"status": "restored", "turn_index": checkpoint.turn_index, "session": session}

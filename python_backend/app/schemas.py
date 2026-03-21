@@ -53,6 +53,26 @@ class Checkpoint(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class KeyMoment(BaseModel):
+    key_moment_id: str = Field(alias="keyMomentId")
+    session_id: str = Field(alias="sessionId")
+    kind: Literal[
+        "first_anchor",
+        "strong_pushback",
+        "first_concession",
+        "emotional_escalation",
+        "agreement_frame_shift",
+    ]
+    label: str
+    summary: str
+    turn_id: str = Field(alias="turnId")
+    turn_index: int = Field(alias="turnIndex")
+    speaker: Literal["user", "agent"]
+    created_at: str = Field(alias="createdAt")
+
+    model_config = {"populate_by_name": True}
+
+
 class CoachingReport(BaseModel):
     report_id: str = Field(alias="reportId")
     session_id: str = Field(alias="sessionId")
@@ -108,9 +128,11 @@ class SessionState(BaseModel):
     config: SimulationConfig
     turns: list[ConversationTurn]
     checkpoints: list[Checkpoint]
+    key_moments: list[KeyMoment] = Field(default_factory=list, alias="keyMoments")
     reports: list[CoachingReport]
     document_chunks: list[DocumentChunk] = Field(alias="documentChunks")
     features: BehavioralFeatures
+    semantic_analysis: dict[str, Any] = Field(default_factory=dict, alias="semanticAnalysis")
     archived_turns: list[ConversationTurn] = Field(alias="archivedTurns")
     live_state: LiveState = Field(alias="liveState")
     created_at: str = Field(alias="createdAt")

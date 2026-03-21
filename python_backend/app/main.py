@@ -65,6 +65,19 @@ def sanitize_session(session: SessionState) -> dict[str, object]:
         }
         for checkpoint in payload["checkpoints"]
     ]
+    payload["keyMoments"] = [
+        {
+            "keyMomentId": moment["keyMomentId"],
+            "kind": moment["kind"],
+            "label": moment["label"],
+            "summary": moment["summary"],
+            "turnId": moment["turnId"],
+            "turnIndex": moment["turnIndex"],
+            "speaker": moment["speaker"],
+            "createdAt": moment["createdAt"],
+        }
+        for moment in payload["keyMoments"]
+    ]
     return payload
 
 
@@ -180,6 +193,24 @@ async def stream_session(websocket: WebSocket, session_id: str) -> None:
                             },
                         },
                     )
+                    for moment in result["key_moments_created"]:
+                        await manager.broadcast(
+                            session_id,
+                            {
+                                "type": "session.key_moment.created",
+                                "session_id": session_id,
+                                "key_moment": {
+                                    "keyMomentId": moment.key_moment_id,
+                                    "kind": moment.kind,
+                                    "label": moment.label,
+                                    "summary": moment.summary,
+                                    "turnId": moment.turn_id,
+                                    "turnIndex": moment.turn_index,
+                                    "speaker": moment.speaker,
+                                    "createdAt": moment.created_at,
+                                },
+                            },
+                        )
             else:
                 await manager.broadcast(session_id, {"type": "error", "session_id": session_id, "message": f"Unsupported event type: {event_type}"})
     except (WebSocketDisconnect, ValueError) as exc:
