@@ -18,6 +18,8 @@ Voice-enabled roleplay coaching prototype with a React frontend and a Python/Fas
 
 ## Environment
 
+Before running the copy commands below, make sure you have your `HF_TOKEN` (Hugging Face access token) ready. After copying, open the `.env` file and add your token.
+
 Python backend:
 
 ```bash
@@ -45,6 +47,7 @@ uvicorn python_backend.app.main:app --reload --port 8000
 
 ```bash
 cd frontend
+npm install
 npm run dev
 ```
 
