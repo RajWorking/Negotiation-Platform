@@ -1,46 +1,49 @@
 from __future__ import annotations
 
+import logging
 import re
 
-from .hf_client import HuggingFaceChatClient
+from .llm_client import LLMClient
 from .personas import persona_template
 from .utils import now_iso, summarize_text
 
+logger = logging.getLogger(__name__)
 
-def _detect_intent(last_user_turn: str) -> str:
-    if re.search(r"\$?\d[\d,]*(?:\.\d+)?", last_user_turn):
+
+def _detect_intent(text: str) -> str:
+    """Classify the user's most recent turn into a negotiation intent."""
+    if re.search(r"\$?\d[\d,]*(?:\.\d+)?", text):
         return "counter"
-    if last_user_turn.strip().endswith("?"):
+    if text.strip().endswith("?"):
         return "question"
-    if re.search(r"\b(because|data|market|impact|evidence|reason)\b", last_user_turn, re.IGNORECASE):
+    if re.search(r"\b(because|data|market|impact|evidence|reason)\b", text, re.IGNORECASE):
         return "justify"
     return "pushback"
 
 
 def _is_instruction_leak(text: str) -> bool:
+    """Detect when the model regurgitates its system prompt instead of role-playing."""
     lowered = text.lower()
     suspicious_markers = [
         "return only json",
         "reply_text",
         "emotion_tags",
-        "intent",
         "stay fully in character",
-        "recent user turn",
         "system prompt",
         "you are a coaching agent",
-        "scenario:",
     ]
-    if any(marker in lowered for marker in suspicious_markers):
-        return True
-    if lowered.strip().startswith("{") and "reply_text" in lowered:
-        return True
-    return False
+    return any(marker in lowered for marker in suspicious_markers)
 
 
-def _fallback_reply_body(intent: str, last_user_turn: str, situation_description: str, mode: str) -> str:
+def _build_heuristic_reply(
+    intent: str,
+    last_user_text: str,
+    situation_description: str,
+    mode: str,
+) -> str:
+    """Generate a rule-based opponent reply when the LLM is unavailable."""
     concise = mode == "fast"
     strategic = mode == "quality"
-    body = summarize_text(last_user_turn, 120)
 
     if intent == "counter":
         if concise:
@@ -72,50 +75,44 @@ def _fallback_reply_body(intent: str, last_user_turn: str, situation_description
             )
         return "I hear the logic, but I still need a stronger justification before I change position."
 
+    # Scenario-specific fallbacks
     if re.search(r"salary|offer|compensation|pay", situation_description, re.IGNORECASE):
         if concise:
-            return "I’m open to the compensation discussion, but I need a stronger case than that."
+            return "I'm open to the compensation discussion, but I need a stronger case than that."
         if strategic:
             return (
-                "I’m open to discussing compensation, but I need a tighter argument around scope, impact, and market "
+                "I'm open to discussing compensation, but I need a tighter argument around scope, impact, and market "
                 "evidence before I can move meaningfully."
             )
-        return "I’m open to discussing compensation, but I need a stronger case than that."
+        return "I'm open to discussing compensation, but I need a stronger case than that."
 
     if re.search(r"rent|lease|landlord|tenant", situation_description, re.IGNORECASE):
         if concise:
-            return "I understand the ask, but I’m not ready to change the rent based on that alone."
+            return "I understand the ask, but I'm not ready to change the rent based on that alone."
         if strategic:
             return (
                 "I understand what you are asking for, but I still need a more concrete case around market evidence, "
                 "property tradeoffs, and why changing the current terms makes sense."
             )
-        return "I understand your position, but I’m not ready to change the current terms based on that alone."
+        return "I understand your position, but I'm not ready to change the current terms based on that alone."
 
+    # Generic fallback
+    body = summarize_text(last_user_text, 120)
     if concise:
-        return f"I understand your point, but I’m not ready to move based on {body}."
+        return f"I understand your point, but I'm not ready to move based on {body}."
     if strategic:
         return (
-            "I understand where you are trying to take this conversation, but I’m not convinced yet. "
+            "I understand where you are trying to take this conversation, but I'm not convinced yet. "
             "If you want movement from me, make the next point more concrete and more valuable from my perspective."
         )
-    return "I understand your position, but I’m not persuaded enough to change mine yet."
-
-
-def _fallback_practice_reply(persona: dict[str, object], last_user_turn: str) -> dict[str, object]:
-    intent = _detect_intent(last_user_turn)
-    reply_text = "I understand your point, but I need a stronger case."
-    return {
-        "reply_text": reply_text,
-        "emotion_tags": list(persona["style_tags"]),
-        "intent": intent,
-        "created_at": now_iso(),
-    }
+    return "I understand your position, but I'm not persuaded enough to change mine yet."
 
 
 class PracticeAgent:
-    def __init__(self, hf_client: HuggingFaceChatClient) -> None:
-        self.hf_client = hf_client
+    """Generates the AI opponent's response during a negotiation simulation."""
+
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
 
     async def generate(
         self,
@@ -124,15 +121,17 @@ class PracticeAgent:
         routing: dict[str, object],
         turns: list[dict[str, object]],
     ) -> dict[str, object]:
-        last_user_turn = next(
+        last_user_text = next(
             (turn["transcript"] for turn in reversed(turns) if turn["speaker"] == "user"),
             "",
         )
         persona = persona_template(str(config["partner_tone"]))
+        context_window = int(routing.get("context_window", 4))
         recent_history = "\n".join(
             f"{turn['speaker']}: {turn['transcript']}"
-            for turn in turns[-min(len(turns), int(routing.get("context_window", 4))):]
+            for turn in turns[-min(len(turns), context_window):]
         )
+
         messages = [
             {
                 "role": "system",
@@ -150,34 +149,47 @@ class PracticeAgent:
                     "Reply as the simulated partner only. No advice.\n"
                     "Return only JSON with keys reply_text, emotion_tags, intent.\n"
                     f"Recent history:\n{recent_history}\n"
-                    f"Recent user turn: {last_user_turn}"
+                    f"Recent user turn: {last_user_text}"
                 ),
             },
         ]
 
-        model_response = await self.hf_client.chat_completion(
+        model_response = await self.llm.chat_completion(
             model=str(routing["chat_model"]),
             messages=messages,
             temperature=0.5 if routing["mode"] == "quality" else 0.3,
             max_tokens=220,
         )
-        parsed = self.hf_client.parse_json_object(model_response or "")
+
+        parsed = self.llm.parse_json_object(model_response or "")
         if parsed and isinstance(parsed.get("reply_text"), str) and not _is_instruction_leak(str(parsed["reply_text"])):
+            parsed["source"] = "llm"
             return parsed
 
-        fallback = _fallback_practice_reply(persona, last_user_turn)
-        fallback["reply_text"] = _fallback_reply_body(
-            fallback["intent"],
-            last_user_turn,
+        # Heuristic fallback
+        if model_response is not None:
+            logger.warning("LLM response unparseable or leaked instructions — falling back to heuristic")
+        intent = _detect_intent(str(last_user_text))
+        reply_text = _build_heuristic_reply(
+            intent,
+            str(last_user_text),
             str(config["situation_description"]),
             str(routing["mode"]),
         )
-        return fallback
+        return {
+            "reply_text": reply_text,
+            "emotion_tags": list(persona["style_tags"]),
+            "intent": intent,
+            "source": "heuristic",
+            "created_at": now_iso(),
+        }
 
 
 class CoachingAgent:
-    def __init__(self, hf_client: HuggingFaceChatClient) -> None:
-        self.hf_client = hf_client
+    """Generates strategic coaching feedback based on the recent conversation."""
+
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
 
     async def generate(
         self,
@@ -193,6 +205,9 @@ class CoachingAgent:
     ) -> dict[str, object]:
         recent_text = "\n".join(f"{turn['speaker']}: {turn['transcript']}" for turn in recent_turns)
         evidence = "\n".join(f"{item['source']}: {item['snippet']}" for item in retrieved)
+        coaching_focuses = config.get("coaching_focuses", [])
+        focuses_text = ", ".join(coaching_focuses) if coaching_focuses else "general negotiation improvement"
+
         messages = [
             {
                 "role": "system",
@@ -205,7 +220,7 @@ class CoachingAgent:
                 "role": "user",
                 "content": (
                     f"Scenario: {config['situation_description']}\n"
-                    f"Coaching focuses: {', '.join(config.get('coaching_focuses', [])) or 'general'}\n"
+                    f"Coaching focuses (prioritize these areas): {focuses_text}\n"
                     f"Recent turns:\n{recent_text}\n"
                     f"Features: {features}\n"
                     f"Semantic analysis: {semantic_analysis}\n"
@@ -215,18 +230,25 @@ class CoachingAgent:
             },
         ]
 
-        model_response = await self.hf_client.chat_completion(
+        model_response = await self.llm.chat_completion(
             model=str(routing["chat_model"]),
             messages=messages,
             temperature=0.2,
             max_tokens=300,
         )
-        parsed = self.hf_client.parse_json_object(model_response or "")
+
+        parsed = self.llm.parse_json_object(model_response or "")
         if parsed and isinstance(parsed.get("suggested_next_move"), str):
+            parsed["source"] = "llm"
             return parsed
 
+        if model_response is not None:
+            logger.warning("Coaching LLM response unparseable — falling back to heuristic")
+
+        # Heuristic coaching based on behavioral features
         strengths: list[str] = []
         weak_signals: list[str] = []
+
         if int(features.get("anchoring_attempts", 0)) > 0:
             strengths.append("You used at least one concrete anchor instead of staying vague.")
         if int(features.get("confidence_cues", 0)) > 0:
@@ -249,4 +271,5 @@ class CoachingAgent:
                 "and ask for a direct counterproposal."
             ),
             "retrieved_evidence": [{"source": item["source"], "snippet": item["snippet"]} for item in retrieved],
+            "source": "heuristic",
         }

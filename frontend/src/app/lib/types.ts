@@ -1,5 +1,7 @@
 export type Mode = "fast" | "balanced" | "quality";
 
+export type ResponseSource = "llm" | "heuristic" | "unknown";
+
 export interface VoiceProfile {
   preset?: string;
   gender?: string;
@@ -17,6 +19,7 @@ export interface TranscriptTurn {
   startedAt: string;
   endedAt?: string;
   metadata?: Record<string, unknown>;
+  source?: ResponseSource;
 }
 
 export interface CheckpointSummary {
@@ -51,6 +54,7 @@ export interface CoachingReportResponse {
     source: string;
     snippet: string;
   }>;
+  source?: ResponseSource;
 }
 
 export interface SessionStateResponse {
@@ -81,14 +85,25 @@ export interface SessionStateResponse {
   reports: Array<Record<string, unknown>>;
 }
 
+export interface ServerCapabilities {
+  stt: boolean;
+  tts: boolean;
+}
+
+export interface VoiceOption {
+  id: string;
+  label: string;
+  description: string;
+  accent: string;
+  gender: string;
+}
+
 export interface SetupDraft {
   situation: string;
   tone: string;
   customTone: string;
   coachingFocuses: string[];
-  gender: string;
-  age: string;
-  accent: string;
+  voiceId: string;
   adviceSpeed: number;
 }
 

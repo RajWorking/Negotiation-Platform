@@ -1,4 +1,10 @@
 fastapi
-uvicorn
-httpx
-websockets
+uvicorn[standard]
+asyncpg
+litellm
+redis
+slowapi
+python-dotenv
+faster-whisper
+kokoro>=0.9
+soundfile

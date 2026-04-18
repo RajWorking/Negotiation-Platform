@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 PERSONAS: dict[str, dict[str, object]] = {
     "aggressive": {
@@ -37,6 +40,16 @@ PERSONAS: dict[str, dict[str, object]] = {
         "opener": "Let's stay concrete.",
         "challenge_style": "Probe assumptions, data, and tradeoffs.",
     },
+    "fearful": {
+        "label": "Fearful",
+        "system_prompt": (
+            "Act risk-averse and cautious. You worry about worst-case outcomes and need extra "
+            "reassurance before agreeing to anything. Express concern about what could go wrong."
+        ),
+        "style_tags": ["anxious", "defensive"],
+        "opener": "I'm not sure this is a good idea.",
+        "challenge_style": "Raise worst-case scenarios, ask for guarantees, and resist bold moves.",
+    },
     "interviewer": {
         "label": "Interviewer",
         "system_prompt": "Drive the conversation like a high-stakes interview and test clarity under pressure.",
@@ -62,13 +75,16 @@ PERSONAS: dict[str, dict[str, object]] = {
 
 
 def persona_template(partner_tone: str) -> dict[str, object]:
-    return PERSONAS.get(
-        partner_tone,
-        {
-            "label": partner_tone.title(),
-            "system_prompt": f"Stay in character as a {partner_tone} conversation partner and do not switch into coach mode.",
-            "style_tags": [partner_tone],
-            "opener": f"I'm responding in a {partner_tone} way.",
-            "challenge_style": f"Keep a {partner_tone} tone while protecting your interests.",
-        },
-    )
+    """Return the persona dict for a given tone, falling back to a dynamic one."""
+    persona = PERSONAS.get(partner_tone)
+    if persona:
+        return persona
+
+    logger.warning("No built-in persona for tone '%s' — using dynamic fallback", partner_tone)
+    return {
+        "label": partner_tone.title(),
+        "system_prompt": f"Stay in character as a {partner_tone} conversation partner and do not switch into coach mode.",
+        "style_tags": [partner_tone],
+        "opener": f"I'm responding in a {partner_tone} way.",
+        "challenge_style": f"Keep a {partner_tone} tone while protecting your interests.",
+    }

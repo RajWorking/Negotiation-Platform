@@ -1,4 +1,4 @@
-import type { CoachingReportResponse, Mode, SessionStateResponse, VoiceProfile } from "./types";
+import type { CoachingReportResponse, Mode, SessionStateResponse, VoiceOption, VoiceProfile } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
@@ -133,4 +133,8 @@ export async function rewindSession(sessionId: string, checkpointId: string) {
       checkpoint_id: checkpointId,
     }),
   });
+}
+
+export async function fetchVoices() {
+  return request<VoiceOption[]>("/voices");
 }

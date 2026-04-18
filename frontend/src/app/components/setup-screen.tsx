@@ -16,7 +16,6 @@ import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Label } from "./ui/label";
 import { Checkbox } from "./ui/checkbox";
-import { RadioGroup, RadioGroupItem } from "./ui/radio-group";
 import { Slider } from "./ui/slider";
 import {
   Select,
@@ -26,8 +25,9 @@ import {
   SelectValue,
 } from "./ui/select";
 import { clearSetupDraft, saveActiveSession, saveSetupDraft, loadSetupDraft } from "../lib/storage";
-import { createSession, sliderValueToMode, startSession, uploadDocuments } from "../lib/api";
+import { createSession, fetchVoices, sliderValueToMode, startSession, uploadDocuments } from "../lib/api";
 import { fileToBase64 } from "../lib/speech";
+import type { VoiceOption } from "../lib/types";
 
 interface UploadStatus {
   name: string;
@@ -60,9 +60,8 @@ export function SetupScreen() {
   const [tone, setTone] = useState("neutral");
   const [customTone, setCustomTone] = useState("");
   const [coachingFocuses, setCoachingFocuses] = useState<string[]>([]);
-  const [gender, setGender] = useState("neutral");
-  const [age, setAge] = useState("middle");
-  const [accent, setAccent] = useState("neutral");
+  const [voiceId, setVoiceId] = useState("af_bella");
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [adviceSpeed, setAdviceSpeed] = useState([50]);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -76,6 +75,21 @@ export function SetupScreen() {
   const mode = sliderValueToMode(adviceSpeed[0]);
   const canStart = Boolean(situation.trim() && selectedTone);
 
+  // Load available voices from backend
+  useEffect(() => {
+    fetchVoices()
+      .then(setVoices)
+      .catch(() => {
+        // Fallback voice list if backend is unreachable
+        setVoices([
+          { id: "af_bella", label: "Bella", description: "American female, warm", accent: "american", gender: "female" },
+          { id: "am_adam", label: "Adam", description: "American male, confident", accent: "american", gender: "male" },
+          { id: "bf_emma", label: "Emma", description: "British female, professional", accent: "british", gender: "female" },
+          { id: "bm_george", label: "George", description: "British male, authoritative", accent: "british", gender: "male" },
+        ]);
+      });
+  }, []);
+
   useEffect(() => {
     const draft = loadSetupDraft();
     if (!draft) {
@@ -85,9 +99,9 @@ export function SetupScreen() {
     setTone(draft.tone);
     setCustomTone(draft.customTone);
     setCoachingFocuses(draft.coachingFocuses);
-    setGender(draft.gender);
-    setAge(draft.age);
-    setAccent(draft.accent);
+    if (draft.voiceId) {
+      setVoiceId(draft.voiceId);
+    }
     setAdviceSpeed([draft.adviceSpeed]);
   }, []);
 
@@ -97,12 +111,10 @@ export function SetupScreen() {
       tone,
       customTone,
       coachingFocuses,
-      gender,
-      age,
-      accent,
+      voiceId,
       adviceSpeed: adviceSpeed[0],
     });
-  }, [situation, tone, customTone, coachingFocuses, gender, age, accent, adviceSpeed]);
+  }, [situation, tone, customTone, coachingFocuses, voiceId, adviceSpeed]);
 
   const handleCoachingFocusToggle = (focus: string) => {
     setCoachingFocuses((prev) =>
@@ -152,11 +164,11 @@ export function SetupScreen() {
     setSubmitError("");
 
     try {
+      const selectedVoice = voices.find((v) => v.id === voiceId);
       const voiceProfile = {
-        preset: `${age}_${gender}_${accent}`,
-        gender,
-        age,
-        accent,
+        preset: voiceId,
+        gender: selectedVoice?.gender,
+        accent: selectedVoice?.accent,
       };
 
       const session = await createSession({
@@ -288,120 +300,32 @@ export function SetupScreen() {
               )}
             </div>
 
-            {/* AI Voice Demographics */}
-            <div className="space-y-4">
+            {/* AI Voice */}
+            <div className="space-y-3">
               <Label className="text-base font-medium text-slate-900">
-                AI Voice Demographics
+                AI Voice
               </Label>
-              
-              <div className="grid grid-cols-2 gap-6">
-                {/* Left: Gender and Age */}
-                <div className="space-y-4">
-                  {/* Gender */}
-                  <div className="space-y-2">
-                    <Label className="text-sm text-slate-700">Gender</Label>
-                    <RadioGroup value={gender} onValueChange={setGender}>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="male" id="male" />
-                        <Label htmlFor="male" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Male
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="female" id="female" />
-                        <Label htmlFor="female" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Female
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="neutral" id="gender-neutral" />
-                        <Label htmlFor="gender-neutral" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Neutral
-                        </Label>
-                      </div>
-                    </RadioGroup>
-                  </div>
-
-                  {/* Age */}
-                  <div className="space-y-2">
-                    <Label className="text-sm text-slate-700">Age</Label>
-                    <RadioGroup value={age} onValueChange={setAge}>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="young" id="young" />
-                        <Label htmlFor="young" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Young
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="middle" id="middle" />
-                        <Label htmlFor="middle" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Middle-aged
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="senior" id="senior" />
-                        <Label htmlFor="senior" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                          <Volume2 className="w-3 h-3 text-slate-400" />
-                          Senior
-                        </Label>
-                      </div>
-                    </RadioGroup>
-                  </div>
-                </div>
-
-                {/* Right: Accent */}
-                <div className="space-y-2">
-                  <Label className="text-sm text-slate-700">Accent</Label>
-                  <RadioGroup value={accent} onValueChange={setAccent}>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="american" id="american" />
-                      <Label htmlFor="american" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        American
-                      </Label>
+              <div className="grid grid-cols-2 gap-2">
+                {voices.map((voice) => (
+                  <button
+                    key={voice.id}
+                    type="button"
+                    onClick={() => setVoiceId(voice.id)}
+                    className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border text-left transition-colors ${
+                      voiceId === voice.id
+                        ? "border-indigo-500 bg-indigo-50 ring-1 ring-indigo-500"
+                        : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"
+                    }`}
+                  >
+                    <Volume2 className={`w-4 h-4 flex-shrink-0 ${
+                      voiceId === voice.id ? "text-indigo-600" : "text-slate-400"
+                    }`} />
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-slate-800">{voice.label}</div>
+                      <div className="text-xs text-slate-500 truncate">{voice.description}</div>
                     </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="british" id="british" />
-                      <Label htmlFor="british" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        British
-                      </Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="australian" id="australian" />
-                      <Label htmlFor="australian" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        Australian
-                      </Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="indian" id="indian" />
-                      <Label htmlFor="indian" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        Indian
-                      </Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="east-asian" id="east-asian" />
-                      <Label htmlFor="east-asian" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        East Asian
-                      </Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="neutral" id="accent-neutral" />
-                      <Label htmlFor="accent-neutral" className="font-normal text-sm cursor-pointer flex items-center gap-1">
-                        <Volume2 className="w-3 h-3 text-slate-400" />
-                        Neutral Global
-                      </Label>
-                    </div>
-                  </RadioGroup>
-                </div>
+                  </button>
+                ))}
               </div>
             </div>
           </div>

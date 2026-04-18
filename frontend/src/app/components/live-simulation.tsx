@@ -1,69 +1,103 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useNavigate } from "react-router";
 import {
   Mic,
   Pause,
   PhoneOff,
-  Settings,
-  StickyNote,
-  Download,
   History,
   Play,
-  Flag,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { ScrollArea } from "./ui/scroll-area";
 import { motion, AnimatePresence } from "motion/react";
 import { clearActiveSession, loadActiveSession } from "../lib/storage";
-import { createSpeechRecognition, speakWithBrowserVoice, stopSpeaking } from "../lib/speech";
-import { endSession, getSessionState, pauseSession, requestCoaching, resumeSession, websocketUrl } from "../lib/api";
-import type { CoachingReportResponse, KeyMoment, SessionStateResponse, TranscriptTurn } from "../lib/types";
+import { createSpeechRecognition, speakWithBrowserVoice, stopSpeaking, createServerAudioPlayer, createPcmMicCapture } from "../lib/speech";
+import type { ServerAudioPlayer, PcmMicCapture } from "../lib/speech";
+import { endSession, getSessionState, pauseSession, requestCoaching, resumeSession, rewindSession, websocketUrl } from "../lib/api";
+import type { CheckpointSummary, CoachingReportResponse, KeyMoment, ResponseSource, SessionStateResponse, TranscriptTurn } from "../lib/types";
 
+// ---------------------------------------------------------------------------
+// Local types
+// ---------------------------------------------------------------------------
 interface TranscriptMessage {
   id: string;
   speaker: "user" | "ai";
   text: string;
   timestamp: number;
+  source?: ResponseSource;
 }
 
 type SessionUiStatus = "connecting" | "listening" | "thinking" | "speaking" | "paused" | "ended" | "error";
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 function toTranscriptMessage(turn: TranscriptTurn): TranscriptMessage {
   return {
     id: turn.turnId,
     speaker: turn.speaker === "user" ? "user" : "ai",
     text: turn.transcript,
     timestamp: Math.floor((new Date(turn.startedAt).getTime() || Date.now()) / 1000),
+    source: turn.source,
   };
 }
 
-function toneToDisplayName(tone: string) {
-  if (tone === "landlord") {
-    return "Landlord";
-  }
-  if (tone === "partner") {
-    return "Partner";
-  }
-  if (tone === "interviewer") {
-    return "Interviewer";
-  }
-  return tone.charAt(0).toUpperCase() + tone.slice(1);
+function toneToDisplayName(tone: string): string {
+  const special: Record<string, string> = { landlord: "Landlord", partner: "Partner", interviewer: "Interviewer" };
+  return special[tone] ?? tone.charAt(0).toUpperCase() + tone.slice(1);
 }
 
+const STATUS_LABELS: Record<SessionUiStatus, string> = {
+  connecting: "Connecting",
+  listening: "Listening",
+  thinking: "Thinking",
+  speaking: "Speaking",
+  paused: "Paused",
+  ended: "Ended",
+  error: "Error",
+};
+
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 export function LiveSimulation() {
   const location = useLocation();
   const navigate = useNavigate();
+
+  // Session metadata (from navigation state or sessionStorage)
+  const activeSession = location.state ?? loadActiveSession();
+  const sessionId: string | undefined = activeSession?.sessionId;
+  const situation: string = activeSession?.situation ?? "Practice conversation";
+  const tone: string = activeSession?.tone ?? "neutral";
+  const mode: string = activeSession?.mode ?? "balanced";
+  const voiceProfile = activeSession?.voiceProfile ?? {};
+  const partnerLabel = toneToDisplayName(tone);
+
+  // UI state
   const [elapsedTime, setElapsedTime] = useState(0);
   const [showCoaching, setShowCoaching] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [keyMoments, setKeyMoments] = useState<KeyMoment[]>([]);
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
   const [currentSpeaker, setCurrentSpeaker] = useState<"user" | "ai" | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionUiStatus>("connecting");
   const [coachingReport, setCoachingReport] = useState<CoachingReportResponse | null>(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [partialTranscript, setPartialTranscript] = useState("");
+  const [lastAgentSource, setLastAgentSource] = useState<ResponseSource>("unknown");
+  const [serverSTTAvailable, setServerSTTAvailable] = useState(false);
+  const [serverTTSAvailable, setServerTTSAvailable] = useState(false);
+
+  // Refs for values needed inside callbacks without re-renders
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -75,84 +109,38 @@ export function LiveSimulation() {
   const sessionStatusRef = useRef<SessionUiStatus>("connecting");
   const lastAgentUtteranceRef = useRef("");
   const ignoreRecognitionUntilRef = useRef(0);
+  const serverAudioPlayerRef = useRef<ServerAudioPlayer | null>(null);
+  const pcmCaptureRef = useRef<PcmMicCapture | null>(null);
+  const serverSTTAvailableRef = useRef(false);
+  const serverTTSAvailableRef = useRef(false);
 
-  const activeSession = location.state ?? loadActiveSession();
-  const sessionId = activeSession?.sessionId;
-  const situation = activeSession?.situation ?? "Practice conversation";
-  const tone = activeSession?.tone ?? "neutral";
-  const voiceProfile = activeSession?.voiceProfile ?? {};
-  const partnerLabel = toneToDisplayName(tone);
+  // Keep refs in sync
+  useEffect(() => { showCoachingRef.current = showCoaching; }, [showCoaching]);
+  useEffect(() => { sessionStatusRef.current = sessionStatus; }, [sessionStatus]);
+  useEffect(() => { serverSTTAvailableRef.current = serverSTTAvailable; }, [serverSTTAvailable]);
+  useEffect(() => { serverTTSAvailableRef.current = serverTTSAvailable; }, [serverTTSAvailable]);
 
+  // ---------------------------------------------------------------------------
   // Timer
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (sessionStatus === "paused" || sessionStatus === "ended") {
-      return;
-    }
-    const interval = setInterval(() => {
-      setElapsedTime((prev) => prev + 1);
-    }, 1000);
+    if (sessionStatus === "paused" || sessionStatus === "ended") return;
+    const interval = setInterval(() => setElapsedTime((prev) => prev + 1), 1000);
     return () => clearInterval(interval);
   }, [sessionStatus]);
 
-  // Auto-scroll transcript
+  // Auto-scroll
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [transcript, partialTranscript, showCoaching]);
 
-  useEffect(() => {
-    showCoachingRef.current = showCoaching;
-  }, [showCoaching]);
-
-  useEffect(() => {
-    sessionStatusRef.current = sessionStatus;
-  }, [sessionStatus]);
-
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  };
-
-  useEffect(() => {
-    if (!sessionId) {
-      navigate("/");
-      return;
-    }
-
-    let cancelled = false;
-
-    const connectSession = async () => {
-      try {
-        const state = await getSessionState(sessionId);
-        if (cancelled) {
-          return;
-        }
-        applySessionState(state);
-        await connectWebSocket(sessionId);
-        if (state.status !== "paused" && state.status !== "ended" && state.liveState.currentSpeaker !== "agent") {
-          await startInputLoop();
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setSessionStatus("error");
-          setErrorMessage(error instanceof Error ? error.message : "Unable to load session");
-        }
-      }
-    };
-
-    void connectSession();
-
-    return () => {
-      cancelled = true;
-      stopInputLoop();
-      stopSpeaking();
-      wsRef.current?.close();
-    };
-  }, [navigate, sessionId]);
-
-  const applySessionState = (state: SessionStateResponse) => {
+  // ---------------------------------------------------------------------------
+  // Apply full session state (used on initial load + rewind)
+  // ---------------------------------------------------------------------------
+  const applySessionState = useCallback((state: SessionStateResponse) => {
     setTranscript(state.turns.map(toTranscriptMessage));
     setKeyMoments(state.keyMoments);
+    setCheckpoints(state.checkpoints);
     setPartialTranscript(state.liveState.partialTranscript ?? "");
     const mappedSpeaker = state.liveState.currentSpeaker === "agent" ? "ai" : state.liveState.currentSpeaker;
     setCurrentSpeaker(mappedSpeaker);
@@ -163,140 +151,64 @@ export function LiveSimulation() {
     } else {
       setSessionStatus(mappedSpeaker === "ai" ? "speaking" : "listening");
     }
-  };
+  }, []);
 
-  const keyMomentEntries = keyMoments
-    .map((moment, index) => {
-      const targetMessage = transcript.find((message) => message.id === moment.turnId);
-      if (!targetMessage) {
-        return null;
-      }
-      return {
-        moment,
-        index,
-        messageId: targetMessage.id,
-      };
-    })
-    .filter((entry): entry is { moment: KeyMoment; index: number; messageId: string } => Boolean(entry));
+  // ---------------------------------------------------------------------------
+  // Echo detection — prevent TTS playback from being recognized as user speech
+  // ---------------------------------------------------------------------------
+  const isLikelyEcho = useCallback((recognizedText: string): boolean => {
+    const norm = (s: string) => s.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+    const recognized = norm(recognizedText);
+    const agent = norm(lastAgentUtteranceRef.current);
+    if (!recognized || !agent || recognized.length < 12) return false;
+    if (agent.includes(recognized) || recognized.includes(agent.slice(0, 32))) return true;
+    const recWords = new Set(recognized.split(" "));
+    const agentWords = new Set(agent.split(" "));
+    const overlap = [...recWords].filter((w) => agentWords.has(w)).length;
+    return overlap / Math.max(recWords.size, 1) >= 0.7;
+  }, []);
 
-  const scrollToMessage = (messageId: string) => {
-    const element = document.getElementById(messageId);
-    if (!element) {
-      return;
-    }
-    element.scrollIntoView({ behavior: "smooth", block: "center" });
-    const bubble = element.querySelector(".message-bubble");
-    if (bubble) {
-      bubble.classList.add("ring-2", "ring-teal-500", "ring-offset-2");
-      window.setTimeout(() => {
-        bubble.classList.remove("ring-2", "ring-teal-500", "ring-offset-2");
-      }, 1600);
-    }
-  };
-
-  const getKeyMomentNumber = (messageId: string) => {
-    const index = keyMomentEntries.findIndex((entry) => entry.messageId === messageId);
-    return index >= 0 ? index + 1 : null;
-  };
-
-  const isLikelyEcho = (recognizedText: string) => {
-    const normalizedRecognized = recognizedText.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
-    const normalizedAgent = lastAgentUtteranceRef.current.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
-    if (!normalizedRecognized || !normalizedAgent || normalizedRecognized.length < 12) {
-      return false;
-    }
-    if (normalizedAgent.includes(normalizedRecognized) || normalizedRecognized.includes(normalizedAgent.slice(0, 32))) {
-      return true;
-    }
-    const recognizedWords = new Set(normalizedRecognized.split(" "));
-    const agentWords = new Set(normalizedAgent.split(" "));
-    const overlap = [...recognizedWords].filter((word) => agentWords.has(word)).length;
-    return overlap / Math.max(recognizedWords.size, 1) >= 0.7;
-  };
-
-  const connectWebSocket = (activeSessionId: string) => {
-    return new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(websocketUrl(activeSessionId));
-      wsRef.current = socket;
-      socket.onopen = () => resolve();
-      socket.onmessage = (event) => {
-        const data = JSON.parse(String(event.data));
-        if (data.type === "session.ready" && data.state) {
-          applySessionState(data.state);
-          return;
-        }
-        if (data.type === "user.transcript.partial") {
-          setPartialTranscript(String(data.text ?? ""));
-          setCurrentSpeaker("user");
-          setSessionStatus("listening");
-          return;
-        }
-        if (data.type === "user.transcript.final" && data.turn) {
-          setPartialTranscript("");
-          setTranscript((prev) => [...prev, toTranscriptMessage(data.turn as TranscriptTurn)]);
-          setCurrentSpeaker("user");
-          return;
-        }
-        if (data.type === "agent.thinking") {
-          setCurrentSpeaker(null);
-          setSessionStatus("thinking");
-          return;
-        }
-        if (data.type === "agent.response.text" && data.turn) {
-          const turn = data.turn as TranscriptTurn;
-          setTranscript((prev) => [...prev, toTranscriptMessage(turn)]);
-          speakAgentTurn(turn.transcript);
-          return;
-        }
-        if (data.type === "agent.response.audio.end") {
-          return;
-        }
-        if (data.type === "session.checkpoint.created" && data.checkpoint) {
-          return;
-        }
-        if (data.type === "session.key_moment.created" && data.key_moment) {
-          setKeyMoments((prev) => {
-            const next = [
-              ...prev.filter((item) => item.keyMomentId !== data.key_moment.keyMomentId && item.kind !== data.key_moment.kind),
-              data.key_moment as KeyMoment,
-            ];
-            return next.sort((left, right) => left.turnIndex - right.turnIndex);
-          });
-          return;
-        }
-        if (data.type === "session.paused") {
-          setSessionStatus("paused");
-          setCurrentSpeaker(null);
-          return;
-        }
-        if (data.type === "session.resumed") {
-          setSessionStatus("listening");
-          return;
-        }
-        if (data.type === "session.rewound" && data.state) {
-          applySessionState(data.state as SessionStateResponse);
-          return;
-        }
-        if (data.type === "error") {
-          setSessionStatus("error");
-          setErrorMessage(String(data.message ?? "Unexpected realtime error"));
-        }
-      };
-      socket.onerror = () => {
-        setSessionStatus("error");
-        setErrorMessage("Realtime connection failed");
-        reject(new Error("Realtime connection failed"));
-      };
-    });
-  };
-
-  const sendRealtimeEvent = (payload: Record<string, unknown>) => {
+  // ---------------------------------------------------------------------------
+  // WebSocket
+  // ---------------------------------------------------------------------------
+  const sendRealtimeEvent = useCallback((payload: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(payload));
     }
-  };
+  }, []);
 
-  const startInputLoop = async () => {
+  // Forward declarations for mutual references between startInputLoop / speakAgentTurn
+  const startInputLoopRef = useRef<() => Promise<void>>();
+  const stopInputLoopRef = useRef<() => void>();
+
+  // ---------------------------------------------------------------------------
+  // Audio / speech recognition lifecycle
+  // ---------------------------------------------------------------------------
+  const stopInputLoop = useCallback(() => {
+    recognitionShouldRestartRef.current = false;
+    if (restartRecognitionTimeoutRef.current) {
+      window.clearTimeout(restartRecognitionTimeoutRef.current);
+      restartRecognitionTimeoutRef.current = null;
+    }
+    recognitionRef.current?.stop();
+    if (pcmCaptureRef.current) {
+      pcmCaptureRef.current.stop();
+      pcmCaptureRef.current = null;
+    }
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    if (serverAudioPlayerRef.current) {
+      serverAudioPlayerRef.current.stop();
+      serverAudioPlayerRef.current = null;
+    }
+  }, []);
+  stopInputLoopRef.current = stopInputLoop;
+
+  const startInputLoop = useCallback(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setErrorMessage("Microphone access is not available in this browser");
       return;
@@ -304,31 +216,38 @@ export function LiveSimulation() {
 
     if (!mediaStreamRef.current) {
       mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
     }
 
+    // Server-side STT — send raw PCM, skip MediaRecorder and browser SpeechRecognition
+    if (serverSTTAvailableRef.current) {
+      if (!pcmCaptureRef.current) {
+        pcmCaptureRef.current = createPcmMicCapture(
+          mediaStreamRef.current,
+          (base64) => sendRealtimeEvent({ type: "user.audio.chunk", base64, format: "pcm_s16le", sample_rate: 16000 }),
+          500,
+        );
+      }
+      pcmCaptureRef.current.start();
+      setSessionStatus("listening");
+      setCurrentSpeaker("user");
+      return;
+    }
+
+    // Browser STT fallback — use MediaRecorder + SpeechRecognition
     if (!mediaRecorderRef.current) {
       const recorder = new MediaRecorder(mediaStreamRef.current, { mimeType: "audio/webm" });
       recorder.ondataavailable = async (chunkEvent) => {
-        if (!chunkEvent.data.size) {
-          return;
-        }
+        if (!chunkEvent.data.size) return;
         const base64 = await blobToBase64(chunkEvent.data);
-        sendRealtimeEvent({
-          type: "user.audio.chunk",
-          base64,
-        });
+        sendRealtimeEvent({ type: "user.audio.chunk", base64 });
       };
       mediaRecorderRef.current = recorder;
     }
 
     if (mediaRecorderRef.current.state === "inactive") {
-      mediaRecorderRef.current.start(1000);
+      mediaRecorderRef.current.start(500);
     }
 
     if (!recognitionRef.current) {
@@ -337,108 +256,301 @@ export function LiveSimulation() {
         setErrorMessage("Live transcription requires a browser with SpeechRecognition support");
         return;
       }
-      if (recognitionRef.current) {
-        recognitionRef.current.onresult = (event) => {
-          if (Date.now() < ignoreRecognitionUntilRef.current) {
-            return;
+
+      recognitionRef.current.onresult = (event) => {
+        if (Date.now() < ignoreRecognitionUntilRef.current) return;
+
+        let interim = "";
+        const finalized: string[] = [];
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const text = result[0]?.transcript?.trim();
+          if (!text) continue;
+          if (result.isFinal) {
+            finalized.push(text);
+          } else {
+            interim += `${text} `;
           }
-          let interim = "";
-          const finalized: string[] = [];
-          for (let index = event.resultIndex; index < event.results.length; index += 1) {
-            const result = event.results[index];
-            const text = result[0]?.transcript?.trim();
-            if (!text) {
-              continue;
-            }
-            if (result.isFinal) {
-              finalized.push(text);
-            } else {
-              interim += `${text} `;
-            }
+        }
+
+        if (interim.trim() && !isLikelyEcho(interim.trim())) {
+          sendRealtimeEvent({ type: "user.transcript.partial", text: interim.trim() });
+        }
+
+        if (finalized.length > 0) {
+          const finalText = finalized.join(" ").trim();
+          if (!isLikelyEcho(finalText)) {
+            sendRealtimeEvent({ type: "user.transcript.final", text: finalText });
           }
-          if (interim.trim() && !isLikelyEcho(interim.trim())) {
-            sendRealtimeEvent({
-              type: "user.transcript.partial",
-              text: interim.trim(),
-            });
-          }
-          if (finalized.length > 0) {
-            const finalText = finalized.join(" ").trim();
-            if (isLikelyEcho(finalText)) {
-              return;
-            }
-            sendRealtimeEvent({
-              type: "user.transcript.final",
-              text: finalText,
-            });
-          }
-        };
-        recognitionRef.current.onerror = () => {
-          setErrorMessage("Speech recognition stopped unexpectedly");
-        };
-        recognitionRef.current.onend = () => {
-          if (
-            recognitionShouldRestartRef.current &&
-            sessionStatusRef.current !== "paused" &&
-            sessionStatusRef.current !== "ended"
-          ) {
-            recognitionRef.current?.start();
-          }
-        };
-      }
+        }
+      };
+
+      recognitionRef.current.onerror = () => {
+        setErrorMessage("Speech recognition stopped unexpectedly");
+      };
+
+      recognitionRef.current.onend = () => {
+        if (
+          recognitionShouldRestartRef.current &&
+          sessionStatusRef.current !== "paused" &&
+          sessionStatusRef.current !== "ended"
+        ) {
+          recognitionRef.current?.start();
+        }
+      };
     }
 
-    if (recognitionRef.current) {
-      recognitionShouldRestartRef.current = true;
-      recognitionRef.current.start();
-    }
-
+    recognitionShouldRestartRef.current = true;
+    recognitionRef.current.start();
     setSessionStatus("listening");
     setCurrentSpeaker("user");
-  };
+  }, [sendRealtimeEvent, isLikelyEcho]);
+  startInputLoopRef.current = startInputLoop;
 
-  const stopInputLoop = () => {
-    recognitionShouldRestartRef.current = false;
-    if (restartRecognitionTimeoutRef.current) {
-      window.clearTimeout(restartRecognitionTimeoutRef.current);
-      restartRecognitionTimeoutRef.current = null;
-    }
-    recognitionRef.current?.stop();
-    if (mediaRecorderRef.current?.state === "recording") {
-      mediaRecorderRef.current.stop();
-    }
-    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-    mediaStreamRef.current = null;
-    mediaRecorderRef.current = null;
-  };
-
-  const speakAgentTurn = (text: string) => {
-    stopInputLoop();
+  const speakAgentTurn = useCallback((text: string) => {
+    stopInputLoopRef.current?.();
     lastAgentUtteranceRef.current = text;
     setCurrentSpeaker("ai");
     setSessionStatus("speaking");
-    speakWithBrowserVoice({
-      text,
-      voiceProfile,
-      onStart: () => {
-        setCurrentSpeaker("ai");
-        setSessionStatus("speaking");
-      },
-      onEnd: () => {
+
+    if (serverTTSAvailableRef.current) {
+      // Server TTS — audio arrives via WebSocket agent.response.audio.chunk events
+      const player = createServerAudioPlayer();
+      serverAudioPlayerRef.current = player;
+      player.onPlaybackEnd(() => {
         ignoreRecognitionUntilRef.current = Date.now() + 1200;
         if (!showCoachingRef.current) {
           restartRecognitionTimeoutRef.current = window.setTimeout(() => {
-            void startInputLoop();
+            void startInputLoopRef.current?.();
           }, 1200);
         }
-      },
-    });
-  };
+      });
+    } else {
+      // Browser TTS fallback
+      speakWithBrowserVoice({
+        text,
+        voiceProfile,
+        onStart: () => {
+          setCurrentSpeaker("ai");
+          setSessionStatus("speaking");
+        },
+        onEnd: () => {
+          ignoreRecognitionUntilRef.current = Date.now() + 1200;
+          if (!showCoachingRef.current) {
+            restartRecognitionTimeoutRef.current = window.setTimeout(() => {
+              void startInputLoopRef.current?.();
+            }, 1200);
+          }
+        },
+      });
+    }
+  }, [voiceProfile]);
 
-  const handlePauseForCoaching = async () => {
+  // ---------------------------------------------------------------------------
+  // WebSocket message handler
+  // ---------------------------------------------------------------------------
+  const connectWebSocket = useCallback((activeSessionId: string) => {
+    return new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(websocketUrl(activeSessionId));
+      wsRef.current = socket;
+
+      socket.onopen = () => resolve();
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(String(event.data));
+
+        switch (data.type) {
+          case "session.ready":
+            if (data.state) applySessionState(data.state);
+            if (data.capabilities) {
+              const stt = !!data.capabilities.stt;
+              const tts = !!data.capabilities.tts;
+              setServerSTTAvailable(stt);
+              setServerTTSAvailable(tts);
+              // Sync refs immediately so startInputLoop sees them
+              serverSTTAvailableRef.current = stt;
+              serverTTSAvailableRef.current = tts;
+            }
+            // Start mic/STT now that capabilities are known
+            if (data.state) {
+              const st = data.state as SessionStateResponse;
+              if (st.status !== "paused" && st.status !== "ended" && st.liveState.currentSpeaker !== "agent") {
+                void startInputLoopRef.current?.();
+              }
+            }
+            break;
+
+          case "user.transcript.partial":
+            setPartialTranscript(String(data.text ?? ""));
+            setCurrentSpeaker("user");
+            setSessionStatus("listening");
+            break;
+
+          case "user.transcript.final":
+            if (data.turn) {
+              setPartialTranscript("");
+              setTranscript((prev) => [...prev, toTranscriptMessage(data.turn as TranscriptTurn)]);
+              setCurrentSpeaker("user");
+            }
+            break;
+
+          case "stt.transcript.partial":
+            setPartialTranscript(String(data.text ?? ""));
+            setCurrentSpeaker("user");
+            setSessionStatus("listening");
+            break;
+
+          case "stt.transcript.final":
+            // Keep showing the text as partial until user.transcript.final replaces it
+            if (data.text) setPartialTranscript(String(data.text));
+            setCurrentSpeaker("user");
+            break;
+
+          case "agent.thinking":
+            setCurrentSpeaker(null);
+            setSessionStatus("thinking");
+            break;
+
+          case "agent.response.text":
+            if (data.turn) {
+              const turn = data.turn as TranscriptTurn & { source?: ResponseSource };
+              const source = turn.source ?? (data.turn as Record<string, unknown>).source as ResponseSource | undefined ?? "unknown";
+              setLastAgentSource(source);
+              setTranscript((prev) => [...prev, { ...toTranscriptMessage(turn), source }]);
+              speakAgentTurn(turn.transcript);
+            }
+            break;
+
+          case "agent.response.audio.chunk":
+            if (serverAudioPlayerRef.current && data.base64) {
+              serverAudioPlayerRef.current.feedChunk(String(data.base64), Number(data.sample_rate ?? 24000));
+            }
+            break;
+
+          case "agent.response.audio.end":
+            if (serverAudioPlayerRef.current) {
+              serverAudioPlayerRef.current.markEnd();
+            }
+            break;
+
+          case "session.checkpoint.created":
+            if (data.checkpoint) {
+              setCheckpoints((prev) => [...prev, data.checkpoint as CheckpointSummary]);
+            }
+            break;
+
+          case "session.key_moment.created":
+            if (data.key_moment) {
+              setKeyMoments((prev) => {
+                const km = data.key_moment as KeyMoment;
+                const next = [...prev.filter((m) => m.keyMomentId !== km.keyMomentId && m.kind !== km.kind), km];
+                return next.sort((a, b) => a.turnIndex - b.turnIndex);
+              });
+            }
+            break;
+
+          case "session.paused":
+            setSessionStatus("paused");
+            setCurrentSpeaker(null);
+            break;
+
+          case "session.resumed":
+            setSessionStatus("listening");
+            break;
+
+          case "session.rewound":
+            if (data.state) applySessionState(data.state as SessionStateResponse);
+            break;
+
+          case "error":
+            setSessionStatus("error");
+            setErrorMessage(String(data.message ?? "Unexpected realtime error"));
+            break;
+
+          default:
+            break;
+        }
+      };
+
+      socket.onerror = () => {
+        setSessionStatus("error");
+        setErrorMessage("Realtime connection failed");
+        reject(new Error("Realtime connection failed"));
+      };
+    });
+  }, [applySessionState, speakAgentTurn]);
+
+  // ---------------------------------------------------------------------------
+  // Session initialization
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
     if (!sessionId) {
+      navigate("/");
       return;
     }
+
+    let cancelled = false;
+    const connectSession = async () => {
+      try {
+        const state = await getSessionState(sessionId);
+        if (cancelled) return;
+        applySessionState(state);
+        await connectWebSocket(sessionId);
+        // startInputLoop is now triggered by the session.ready WebSocket event
+        // so that server capabilities (STT/TTS) are known before deciding the input path
+      } catch (error) {
+        if (!cancelled) {
+          setSessionStatus("error");
+          setErrorMessage(error instanceof Error ? error.message : "Unable to load session");
+        }
+      }
+    };
+    void connectSession();
+
+    return () => {
+      cancelled = true;
+      stopInputLoop();
+      stopSpeaking();
+      if (serverAudioPlayerRef.current) {
+        serverAudioPlayerRef.current.stop();
+        serverAudioPlayerRef.current = null;
+      }
+      wsRef.current?.close();
+    };
+  }, [navigate, sessionId, applySessionState, connectWebSocket, stopInputLoop]);
+
+  // ---------------------------------------------------------------------------
+  // Key moments + checkpoints for sidebar
+  // ---------------------------------------------------------------------------
+  const keyMomentEntries = keyMoments
+    .map((moment) => {
+      const targetMessage = transcript.find((m) => m.id === moment.turnId);
+      if (!targetMessage) return null;
+      return { moment, messageId: targetMessage.id };
+    })
+    .filter((e): e is { moment: KeyMoment; messageId: string } => Boolean(e));
+
+  const scrollToMessage = (messageId: string) => {
+    const element = document.getElementById(messageId);
+    if (!element) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+    const bubble = element.querySelector(".message-bubble");
+    if (bubble) {
+      bubble.classList.add("ring-2", "ring-teal-500", "ring-offset-2");
+      window.setTimeout(() => bubble.classList.remove("ring-2", "ring-teal-500", "ring-offset-2"), 1600);
+    }
+  };
+
+  const getKeyMomentNumber = (messageId: string) => {
+    const idx = keyMomentEntries.findIndex((e) => e.messageId === messageId);
+    return idx >= 0 ? idx + 1 : null;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Actions
+  // ---------------------------------------------------------------------------
+  const handlePauseForCoaching = async () => {
+    if (!sessionId) return;
     setShowCoaching(true);
     setCoachingLoading(true);
     setCoachingReport(null);
@@ -459,77 +571,70 @@ export function LiveSimulation() {
   };
 
   const handleResumeSimulation = async () => {
-    if (!sessionId) {
-      return;
-    }
+    if (!sessionId) return;
     await resumeSession(sessionId);
     setShowCoaching(false);
     setCoachingReport(null);
     await startInputLoop();
   };
 
-  const handleEndConversation = async () => {
-    if (confirm("Are you sure you want to end this simulation?")) {
-      if (sessionId) {
-        await endSession(sessionId);
-      }
-      stopInputLoop();
-      stopSpeaking();
-      clearActiveSession();
-      navigate("/");
+  const handleRewind = async (checkpointId: string) => {
+    if (!sessionId) return;
+    stopInputLoop();
+    stopSpeaking();
+    try {
+      await rewindSession(sessionId, checkpointId);
+      // The WebSocket broadcast will trigger applySessionState via "session.rewound"
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Rewind failed");
     }
   };
 
-  const getCheckpointTimestamp = (createdAt: string) => {
-    return new Date(createdAt).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+  const handleEndConversation = async () => {
+    if (!confirm("Are you sure you want to end this simulation?")) return;
+    if (sessionId) await endSession(sessionId);
+    stopInputLoop();
+    stopSpeaking();
+    clearActiveSession();
+    navigate("/");
   };
 
-  const statusLabel = sessionStatus === "connecting"
-    ? "Connecting"
-    : sessionStatus === "listening"
-      ? "Listening"
-      : sessionStatus === "thinking"
-        ? "Thinking"
-        : sessionStatus === "speaking"
-          ? "Speaking"
-          : sessionStatus === "paused"
-            ? "Paused"
-            : sessionStatus === "ended"
-              ? "Ended"
-              : "Error";
+  const getCheckpointTimestamp = (createdAt: string) =>
+    new Date(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-slate-100 text-slate-800 flex flex-col">
       {/* Top Bar */}
       <div className="border-b border-slate-200 bg-white/80 backdrop-blur-sm px-6 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
           <h1 className="text-lg font-medium truncate max-w-md text-slate-800">{situation}</h1>
           <Badge variant="outline" className="bg-slate-100 text-slate-600 border-slate-300">
-            {tone}
+            {partnerLabel}
+          </Badge>
+          <Badge variant="outline" className="bg-indigo-50 text-indigo-700 border-indigo-200 capitalize">
+            {mode}
           </Badge>
           <Badge variant="outline" className="bg-teal-50 text-teal-700 border-teal-200">
-            {statusLabel}
+            {STATUS_LABELS[sessionStatus]}
           </Badge>
+          {lastAgentSource === "heuristic" && (
+            <Badge variant="outline" className="bg-amber-50 text-amber-700 border-amber-200 text-xs">
+              Heuristic mode
+            </Badge>
+          )}
         </div>
         <div className="flex items-center gap-4">
           <div className="text-lg font-mono text-slate-500">{formatTime(elapsedTime)}</div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="text-slate-500 hover:text-slate-800 hover:bg-slate-100"
-          >
-            <Settings className="w-5 h-5" />
-          </Button>
         </div>
       </div>
 
-      {/* Main Layout with Sidebar */}
+      {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Sidebar - Key Moments */}
-        <div className="w-64 bg-white/80 backdrop-blur-sm border-r border-slate-200 shadow-sm flex flex-col">
+        {/* Left Sidebar — Key Moments & Checkpoints */}
+        <div className="w-80 bg-white/80 backdrop-blur-sm border-r border-slate-200 shadow-sm flex flex-col">
           <div className="p-4 border-b border-slate-200">
             <h2 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
               <History className="w-4 h-4" />
@@ -538,26 +643,20 @@ export function LiveSimulation() {
           </div>
           <ScrollArea className="flex-1 p-4">
             <div className="space-y-2">
-              {keyMomentEntries.map(({ moment, index, messageId }) => (
+              {keyMomentEntries.map(({ moment, messageId }, idx) => (
                 <button
                   key={moment.keyMomentId}
                   onClick={() => scrollToMessage(messageId)}
-                  className="w-full text-left px-4 py-3 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 hover:border-slate-300 transition-all group"
+                  className="w-full text-left px-4 py-3 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 hover:border-slate-300 transition-all"
                 >
                   <div className="flex items-start gap-3">
                     <div className="w-8 h-8 rounded-full bg-teal-100 text-teal-600 flex items-center justify-center text-xs font-semibold flex-shrink-0">
-                      {index + 1}
+                      {idx + 1}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-slate-800 mb-1">
-                        {moment.label}
-                      </div>
-                      <div className="text-xs text-slate-500 mb-1">
-                        {moment.summary}
-                      </div>
-                      <div className="text-xs text-slate-500 font-mono">
-                        {getCheckpointTimestamp(moment.createdAt)}
-                      </div>
+                      <div className="text-sm font-medium text-slate-800 mb-1">{moment.label}</div>
+                      <div className="text-xs text-slate-500 mb-1">{moment.summary}</div>
+                      <div className="text-xs text-slate-500 font-mono">{getCheckpointTimestamp(moment.createdAt)}</div>
                     </div>
                   </div>
                 </button>
@@ -566,46 +665,59 @@ export function LiveSimulation() {
                 <div className="text-sm text-slate-500">Key moments appear after completed turns.</div>
               )}
             </div>
+
+            {/* Checkpoints / Rewind */}
+            {checkpoints.length > 0 && (
+              <div className="mt-6">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2 flex items-center gap-1">
+                  <RotateCcw className="w-3 h-3" />
+                  Checkpoints
+                </h3>
+                <div className="space-y-1">
+                  {checkpoints.map((cp) => (
+                    <div
+                      key={cp.checkpointId}
+                      className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-slate-50 border border-slate-200 text-xs"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="text-slate-700 line-clamp-2">{cp.summary}</div>
+                        <div className="text-slate-400 font-mono">{getCheckpointTimestamp(cp.createdAt)}</div>
+                      </div>
+                      <button
+                        onClick={() => handleRewind(cp.checkpointId)}
+                        className="flex-shrink-0 text-indigo-600 hover:text-indigo-800 transition-colors"
+                        title="Rewind to this point"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </ScrollArea>
         </div>
 
         {/* Main Content */}
         <div className="flex-1 flex flex-col items-center justify-center p-8 relative overflow-auto">
-          {/* Waveform Visualization and Transcript - Side by Side Layout */}
           <div className="w-full max-w-7xl flex items-center gap-6 h-full">
-            {/* User Microphone - Left Side */}
+            {/* User Mic — Left */}
             <div className="flex flex-col items-center gap-4 flex-shrink-0">
               <div className="relative w-32 h-32">
-                {/* User Waveform (Teal) */}
                 <motion.div
                   className="absolute inset-0 rounded-full"
                   animate={{
-                    boxShadow: currentSpeaker === "user" 
-                      ? [
-                          "0 0 0 0px rgba(20, 184, 166, 0.4)",
-                          "0 0 0 20px rgba(20, 184, 166, 0)",
-                          "0 0 0 0px rgba(20, 184, 166, 0)",
-                        ]
-                      : "0 0 0 0px rgba(20, 184, 166, 0)",
+                    boxShadow: currentSpeaker === "user"
+                      ? ["0 0 0 0px rgba(20,184,166,0.4)", "0 0 0 20px rgba(20,184,166,0)", "0 0 0 0px rgba(20,184,166,0)"]
+                      : "0 0 0 0px rgba(20,184,166,0)",
                   }}
-                  transition={{
-                    duration: 1.5,
-                    repeat: currentSpeaker === "user" ? Infinity : 0,
-                    ease: "easeOut",
-                  }}
+                  transition={{ duration: 1.5, repeat: currentSpeaker === "user" ? Infinity : 0, ease: "easeOut" }}
                 >
                   <div className="absolute inset-4 rounded-full bg-teal-500/20 border-2 border-teal-500/40" />
                 </motion.div>
-
-                {/* Center Icon */}
                 <div className="absolute inset-0 flex items-center justify-center">
                   <div className="w-16 h-16 rounded-full bg-white shadow-lg flex items-center justify-center border-2 border-teal-400/60">
-                    <motion.div
-                      animate={{ 
-                        scale: currentSpeaker === "user" ? [1, 1.1, 1] : 1 
-                      }}
-                      transition={{ duration: 1, repeat: currentSpeaker === "user" ? Infinity : 0 }}
-                    >
+                    <motion.div animate={{ scale: currentSpeaker === "user" ? [1, 1.1, 1] : 1 }} transition={{ duration: 1, repeat: currentSpeaker === "user" ? Infinity : 0 }}>
                       <Mic className={`w-6 h-6 ${currentSpeaker === "user" ? "text-teal-500" : "text-slate-400"}`} />
                     </motion.div>
                   </div>
@@ -614,23 +726,17 @@ export function LiveSimulation() {
               <span className="text-sm font-medium text-teal-600">You</span>
             </div>
 
-            {/* Transcript Panel - Center */}
+            {/* Transcript Panel */}
             <div className="flex-1 bg-white/80 backdrop-blur-sm rounded-xl p-6 shadow-lg border border-slate-200 h-[calc(100vh-16rem)]">
               <ScrollArea className="h-full">
                 <div className="space-y-4 pr-4 pt-4">
                   {transcript.map((message) => (
-                    <div
-                      key={message.id}
-                      id={message.id}
-                      className={`flex ${message.speaker === "user" ? "justify-start" : "justify-end"} transition-all duration-300`}
-                    >
-                      <div
-                        className={`relative max-w-[70%] px-4 py-3 rounded-lg shadow-sm ${
-                          message.speaker === "user"
-                            ? "bg-teal-50 border border-teal-200 text-teal-900"
-                            : "bg-orange-50 border border-orange-200 text-orange-900"
-                        } message-bubble`}
-                      >
+                    <div key={message.id} id={message.id} className={`flex ${message.speaker === "user" ? "justify-start" : "justify-end"} transition-all duration-300`}>
+                      <div className={`relative max-w-[70%] px-4 py-3 rounded-lg shadow-sm ${
+                        message.speaker === "user"
+                          ? "bg-teal-50 border border-teal-200 text-teal-900"
+                          : "bg-orange-50 border border-orange-200 text-orange-900"
+                      } message-bubble`}>
                         {getKeyMomentNumber(message.id) && (
                           <div className="absolute -top-2 -right-2 w-6 h-6 bg-teal-500 rounded-full flex items-center justify-center shadow-md">
                             <span className="text-white text-xs font-bold">{getKeyMomentNumber(message.id)}</span>
@@ -656,39 +762,23 @@ export function LiveSimulation() {
               </ScrollArea>
             </div>
 
-            {/* AI Microphone - Right Side */}
+            {/* AI Mic — Right */}
             <div className="flex flex-col items-center gap-4 flex-shrink-0">
               <div className="relative w-32 h-32">
-                {/* AI Waveform (Coral/Orange) */}
                 <motion.div
                   className="absolute inset-0 rounded-full"
                   animate={{
-                    boxShadow: currentSpeaker === "ai" 
-                      ? [
-                          "0 0 0 0px rgba(251, 146, 60, 0.4)",
-                          "0 0 0 20px rgba(251, 146, 60, 0)",
-                          "0 0 0 0px rgba(251, 146, 60, 0)",
-                        ]
-                      : "0 0 0 0px rgba(251, 146, 60, 0)",
+                    boxShadow: currentSpeaker === "ai"
+                      ? ["0 0 0 0px rgba(251,146,60,0.4)", "0 0 0 20px rgba(251,146,60,0)", "0 0 0 0px rgba(251,146,60,0)"]
+                      : "0 0 0 0px rgba(251,146,60,0)",
                   }}
-                  transition={{
-                    duration: 1.5,
-                    repeat: currentSpeaker === "ai" ? Infinity : 0,
-                    ease: "easeOut",
-                  }}
+                  transition={{ duration: 1.5, repeat: currentSpeaker === "ai" ? Infinity : 0, ease: "easeOut" }}
                 >
                   <div className="absolute inset-4 rounded-full bg-orange-400/20 border-2 border-orange-400/40" />
                 </motion.div>
-
-                {/* Center Icon */}
                 <div className="absolute inset-0 flex items-center justify-center">
                   <div className="w-16 h-16 rounded-full bg-white shadow-lg flex items-center justify-center border-2 border-orange-400/60">
-                    <motion.div
-                      animate={{ 
-                        scale: currentSpeaker === "ai" ? [1, 1.1, 1] : 1 
-                      }}
-                      transition={{ duration: 1, repeat: currentSpeaker === "ai" ? Infinity : 0 }}
-                    >
+                    <motion.div animate={{ scale: currentSpeaker === "ai" ? [1, 1.1, 1] : 1 }} transition={{ duration: 1, repeat: currentSpeaker === "ai" ? Infinity : 0 }}>
                       <Mic className={`w-6 h-6 ${currentSpeaker === "ai" ? "text-orange-400" : "text-slate-400"}`} />
                     </motion.div>
                   </div>
@@ -702,27 +792,23 @@ export function LiveSimulation() {
 
       {/* Bottom Control Bar */}
       <div className="border-t border-slate-200 px-6 py-6 bg-white/90 backdrop-blur-sm shadow-lg">
-        <div className="max-w-4xl mx-auto flex items-center justify-center">
-          {/* Center Controls - Symmetric Layout */}
-          <div className="flex items-center gap-4">
-            <Button
-              onClick={handlePauseForCoaching}
-              size="lg"
-              className="bg-yellow-500 hover:bg-yellow-600 text-white px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transition-all"
-            >
-              <Pause className="w-5 h-5 mr-2" />
-              Pause & Get Coaching
-            </Button>
-
-            <Button
-              onClick={handleEndConversation}
-              size="lg"
-              className="bg-red-500 hover:bg-red-600 text-white px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transition-all"
-            >
-              <PhoneOff className="w-5 h-5 mr-2" />
-              End Call
-            </Button>
-          </div>
+        <div className="max-w-4xl mx-auto flex items-center justify-center gap-4">
+          <Button
+            onClick={handlePauseForCoaching}
+            size="lg"
+            className="bg-yellow-500 hover:bg-yellow-600 text-white px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transition-all"
+          >
+            <Pause className="w-5 h-5 mr-2" />
+            Pause & Get Coaching
+          </Button>
+          <Button
+            onClick={handleEndConversation}
+            size="lg"
+            className="bg-red-500 hover:bg-red-600 text-white px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transition-all"
+          >
+            <PhoneOff className="w-5 h-5 mr-2" />
+            End Call
+          </Button>
         </div>
       </div>
 
@@ -747,6 +833,9 @@ export function LiveSimulation() {
               <div className="p-6 border-b border-teal-700">
                 <h2 className="text-2xl font-semibold text-teal-100">Strategic Feedback</h2>
                 <p className="text-sm text-teal-300 mt-1">Review your approach and adjust</p>
+                {coachingReport?.source === "heuristic" && (
+                  <p className="text-xs text-amber-300 mt-2">Based on behavioral patterns (LLM unavailable)</p>
+                )}
               </div>
 
               <ScrollArea className="flex-1 p-6">
@@ -754,78 +843,70 @@ export function LiveSimulation() {
                   <div className="text-sm text-teal-200">Analyzing recent turns and guidance materials...</div>
                 ) : coachingReport ? (
                   <div className="space-y-6">
-                  {/* What You're Doing Well */}
-                  <div>
-                    <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-green-400" />
-                      What You're Doing Well
-                    </h3>
-                    <ul className="space-y-2 text-teal-200 text-sm">
-                      {coachingReport.strengths.map((item) => (
-                        <li key={item} className="flex gap-2">
-                          <span className="text-green-400">•</span>
-                          <span>{item}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  {/* Weak Signals */}
-                  <div>
-                    <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-amber-400" />
-                      Weak Signals
-                    </h3>
-                    <ul className="space-y-2 text-teal-200 text-sm">
-                      {coachingReport.weak_signals.map((item) => (
-                        <li key={item} className="flex gap-2">
-                          <span className="text-amber-400">•</span>
-                          <span>{item}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  {/* Suggested Next Move */}
-                  <div>
-                    <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-blue-400" />
-                      Suggested Next Move
-                    </h3>
-                    <div className="bg-teal-950/50 border border-teal-700 rounded-lg p-4">
-                      <p className="text-teal-100 text-sm leading-relaxed">
-                        {coachingReport.suggested_next_move}
-                      </p>
-                    </div>
-                  </div>
-
-                  {coachingReport.retrieved_evidence.length > 0 && (
                     <div>
                       <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                        Retrieved Evidence
+                        <span className="w-2 h-2 rounded-full bg-green-400" />
+                        What You're Doing Well
                       </h3>
-                      <div className="space-y-3">
-                        {coachingReport.retrieved_evidence.map((item) => (
-                          <div key={`${item.source}-${item.snippet}`} className="rounded-lg border border-teal-700 bg-teal-950/40 p-4">
-                            <div className="text-xs uppercase tracking-wide text-teal-300 mb-2">{item.source}</div>
-                            <div className="text-sm text-teal-100">{item.snippet}</div>
-                          </div>
+                      <ul className="space-y-2 text-teal-200 text-sm">
+                        {coachingReport.strengths.map((item) => (
+                          <li key={item} className="flex gap-2">
+                            <span className="text-green-400">•</span>
+                            <span>{item}</span>
+                          </li>
                         ))}
+                      </ul>
+                    </div>
+
+                    <div>
+                      <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-amber-400" />
+                        Weak Signals
+                      </h3>
+                      <ul className="space-y-2 text-teal-200 text-sm">
+                        {coachingReport.weak_signals.map((item) => (
+                          <li key={item} className="flex gap-2">
+                            <span className="text-amber-400">•</span>
+                            <span>{item}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    <div>
+                      <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-blue-400" />
+                        Suggested Next Move
+                      </h3>
+                      <div className="bg-teal-950/50 border border-teal-700 rounded-lg p-4">
+                        <p className="text-teal-100 text-sm leading-relaxed">{coachingReport.suggested_next_move}</p>
                       </div>
                     </div>
-                  )}
-                </div>
+
+                    {coachingReport.retrieved_evidence.length > 0 && (
+                      <div>
+                        <h3 className="text-lg font-medium text-teal-100 mb-3 flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                          Retrieved Evidence
+                        </h3>
+                        <div className="space-y-3">
+                          {coachingReport.retrieved_evidence.map((item) => (
+                            <div key={`${item.source}-${item.snippet}`} className="rounded-lg border border-teal-700 bg-teal-950/40 p-4">
+                              <div className="text-xs uppercase tracking-wide text-teal-300 mb-2">{item.source}</div>
+                              <div className="text-sm text-teal-100">{item.snippet}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <div className="text-sm text-teal-200">No coaching report is available yet.</div>
                 )}
               </ScrollArea>
 
               <div className="p-6 border-t border-teal-700">
-                <Button
-                  onClick={handleResumeSimulation}
-                  className="w-full bg-teal-600 hover:bg-teal-700 text-white h-12"
-                >
+                <Button onClick={handleResumeSimulation} className="w-full bg-teal-600 hover:bg-teal-700 text-white h-12">
                   <Play className="w-5 h-5 mr-2" />
                   Resume Simulation
                 </Button>
@@ -835,22 +916,24 @@ export function LiveSimulation() {
         )}
       </AnimatePresence>
 
+      {/* Error Toast */}
       {errorMessage && (
         <div className="fixed bottom-6 right-6 max-w-sm rounded-lg border border-red-200 bg-white px-4 py-3 text-sm text-red-700 shadow-lg">
           {errorMessage}
+          <button onClick={() => setErrorMessage("")} className="ml-3 text-red-400 hover:text-red-600">&times;</button>
         </div>
       )}
     </div>
   );
 }
 
-async function blobToBase64(blob: Blob) {
+async function blobToBase64(blob: Blob): Promise<string> {
   const buffer = await blob.arrayBuffer();
   let binary = "";
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
 }
