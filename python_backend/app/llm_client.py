@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 import litellm
@@ -100,11 +101,18 @@ class LLMClient:
         except json.JSONDecodeError:
             pass
 
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
+        stripped = re.sub(r"```(?:json)?\s*", "", raw_text).strip().rstrip("`")
+
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        start = stripped.find("{")
+        end = stripped.rfind("}")
         if start == -1 or end == -1 or end <= start:
             return None
         try:
-            return json.loads(raw_text[start : end + 1])
+            return json.loads(stripped[start : end + 1])
         except json.JSONDecodeError:
             return None

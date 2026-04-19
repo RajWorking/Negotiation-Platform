@@ -81,6 +81,7 @@ class CoachingReport(BaseModel):
     weak_signals: list[str] = Field(alias="weakSignals")
     suggested_next_move: str = Field(alias="suggestedNextMove")
     retrieved_evidence: list[dict[str, str]] = Field(alias="retrievedEvidence")
+    source: Optional[str] = None
     created_at: str = Field(alias="createdAt")
 
     model_config = {"populate_by_name": True}

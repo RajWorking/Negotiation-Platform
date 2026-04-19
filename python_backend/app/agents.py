@@ -218,17 +218,26 @@ class CoachingAgent:
             {
                 "role": "system",
                 "content": (
-                    "You are a coaching agent. Return concise actionable JSON only with keys "
-                    "strengths, weak_signals, suggested_next_move, retrieved_evidence."
+                    "You are a negotiation coaching agent. Analyze the conversation and return "
+                    "a single raw JSON object with NO markdown, NO code fences, NO explanation. "
+                    "Respond with ONLY the JSON object.\n\n"
+                    "Required schema:\n"
+                    '{"strengths": ["str", ...], "weak_signals": ["str", ...], '
+                    '"suggested_next_move": "str", "retrieved_evidence": [{"source": "str", "snippet": "str"}, ...]}\n\n'
+                    "Rules:\n"
+                    "- strengths: 1-3 specific things the user did well, referencing what they actually said\n"
+                    "- weak_signals: 1-3 areas to improve, referencing specific moments\n"
+                    "- suggested_next_move: one concrete actionable sentence for their next turn\n"
+                    "- retrieved_evidence: relevant items from the provided evidence, or empty array if none"
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Scenario: {config['situation_description']}\n"
-                    f"Coaching focuses (prioritize these areas): {focuses_text}\n"
-                    f"Recent turns:\n{recent_text}\n"
-                    f"Features: {features}\n"
+                    f"Coaching focuses (prioritize these areas): {focuses_text}\n\n"
+                    f"Recent conversation:\n{recent_text}\n\n"
+                    f"Behavioral features: {features}\n"
                     f"Semantic analysis: {semantic_analysis}\n"
                     f"Key moments: {key_moments}\n"
                     f"Retrieved evidence:\n{evidence or 'none'}"
@@ -240,7 +249,7 @@ class CoachingAgent:
             model=str(routing["chat_model"]),
             messages=messages,
             temperature=0.2,
-            max_tokens=300,
+            max_tokens=500,
         )
 
         parsed = self.llm.parse_json_object(model_response or "")

@@ -214,6 +214,7 @@ async def coach_session(session_id: str, body: CoachRequest, _=Depends(require_a
         "weak_signals": report.weak_signals,
         "suggested_next_move": report.suggested_next_move,
         "retrieved_evidence": report.retrieved_evidence,
+        "source": report.source,
     }
 
 

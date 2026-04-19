@@ -383,7 +383,11 @@ class SessionOrchestrator:
             strengths=list(payload.get("strengths", []))[:3],
             weakSignals=list(payload.get("weak_signals", []))[:3],
             suggestedNextMove=str(payload.get("suggested_next_move", "")),
-            retrievedEvidence=list(payload.get("retrieved_evidence", [])),
+            retrievedEvidence=[
+                item if isinstance(item, dict) else {"source": "conversation", "snippet": str(item)}
+                for item in list(payload.get("retrieved_evidence", []))
+            ],
+            source=str(payload.get("source", "")),
             createdAt=now_iso(),
         )
         session.reports.append(report)
