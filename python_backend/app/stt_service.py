@@ -52,7 +52,7 @@ class STTService:
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
-        self._model = None
+        self._models: dict[str, object] = {}
         self._available = False
         self._import_checked = False
         self._buffers: dict[str, _SessionBuffer] = {}
@@ -76,14 +76,14 @@ class STTService:
             logger.warning("faster-whisper not importable: %s — server STT disabled", exc)
             self._available = False
 
-    def _ensure_model(self) -> None:
-        if self._model is not None:
-            return
+    def _ensure_model(self, model_size: Optional[str] = None) -> object:
+        size = model_size or self.model_size
+        if size in self._models:
+            return self._models[size]
 
         try:
             from faster_whisper import WhisperModel
 
-            # Auto-detect device
             device = self.device
             compute_type = self.compute_type
             if device == "auto":
@@ -95,16 +95,15 @@ class STTService:
             if compute_type == "auto":
                 compute_type = "float16" if device == "cuda" else "int8"
 
-            self._model = WhisperModel(
-                self.model_size,
-                device=device,
-                compute_type=compute_type,
-            )
+            model = WhisperModel(size, device=device, compute_type=compute_type)
+            self._models[size] = model
             self._available = True
-            logger.info("STT model loaded: size=%s device=%s compute=%s", self.model_size, device, compute_type)
+            logger.info("STT model loaded: size=%s device=%s compute=%s", size, device, compute_type)
+            return model
         except Exception as exc:
-            logger.warning("Failed to load STT model: %s — server STT disabled", exc)
+            logger.warning("Failed to load STT model (size=%s): %s — server STT disabled", size, exc)
             self._available = False
+            return None
 
     def _get_buffer(self, session_id: str) -> _SessionBuffer:
         if session_id not in self._buffers:
@@ -134,7 +133,9 @@ class STTService:
             logger.warning("Audio decode failed: %s", exc)
             return None
 
-    def _transcribe_sync(self, pcm_data: bytes) -> TranscriptionResult:
+    def _transcribe_sync(
+        self, pcm_data: bytes, model_size: Optional[str] = None, beam_size: int = 3
+    ) -> TranscriptionResult:
         """Run Whisper transcription (blocking). Called via asyncio.to_thread."""
         import numpy as np
 
@@ -143,9 +144,13 @@ class STTService:
         if len(audio_array) < 1600:  # < 0.1s of audio at 16kHz
             return TranscriptionResult(text="", is_final=False, confidence=0.0)
 
-        segments, info = self._model.transcribe(
+        model = self._models.get(model_size or self.model_size)
+        if model is None:
+            return TranscriptionResult(text="", is_final=False, confidence=0.0)
+
+        segments, info = model.transcribe(
             audio_array,
-            beam_size=3,
+            beam_size=beam_size,
             language="en",
             vad_filter=True,
             vad_parameters=dict(
@@ -168,7 +173,12 @@ class STTService:
         return TranscriptionResult(text=text, is_final=False, confidence=confidence)
 
     async def transcribe_chunk(
-        self, session_id: str, audio_bytes: bytes, is_raw_pcm: bool = False
+        self,
+        session_id: str,
+        audio_bytes: bytes,
+        is_raw_pcm: bool = False,
+        model_size: Optional[str] = None,
+        beam_size: int = 3,
     ) -> Optional[TranscriptionResult]:
         """Feed an audio chunk and return a transcription result if ready.
 
@@ -179,7 +189,7 @@ class STTService:
         If is_raw_pcm is True, audio_bytes is 16kHz mono int16 PCM.
         Otherwise it is webm/opus and will be decoded.
         """
-        self._ensure_model()
+        self._ensure_model(model_size)
         if not self._available:
             return None
 
@@ -208,7 +218,7 @@ class STTService:
             return None
 
         pcm_data = b"".join(buf.pcm_parts)
-        result = await asyncio.to_thread(self._transcribe_sync, pcm_data)
+        result = await asyncio.to_thread(self._transcribe_sync, pcm_data, model_size, beam_size)
         buf.last_partial_at = now
 
         if not result.text:
@@ -229,9 +239,14 @@ class STTService:
 
         return result
 
-    async def finalize_session_audio(self, session_id: str) -> Optional[TranscriptionResult]:
+    async def finalize_session_audio(
+        self,
+        session_id: str,
+        model_size: Optional[str] = None,
+        beam_size: int = 3,
+    ) -> Optional[TranscriptionResult]:
         """Force-transcribe any remaining buffered audio and return final result."""
-        self._ensure_model()
+        self._ensure_model(model_size)
         if not self._available:
             return None
 
@@ -244,7 +259,7 @@ class STTService:
             self.reset_session(session_id)
             return None
 
-        result = await asyncio.to_thread(self._transcribe_sync, pcm_data)
+        result = await asyncio.to_thread(self._transcribe_sync, pcm_data, model_size, beam_size)
         self.reset_session(session_id)
 
         if not result.text:

@@ -47,14 +47,14 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 **Core flow:** `main.py` → `SessionOrchestrator` → agents/services
 
 #### Session & Orchestration
-- **`orchestrator.py`** — Central coordinator. Manages session lifecycle (create/start/pause/resume/end), processes user transcripts, triggers agent responses, creates checkpoints, runs coaching, and coordinates STT/TTS. All session mutations go through here. `finalize_user_transcript()` accepts an optional `on_progress` callback for broadcasting status updates. Semantic analysis runs separately via `run_background_analysis()` (called as an `asyncio.create_task` from `main.py`) so agent responses are not blocked by it.
+- **`orchestrator.py`** — Central coordinator. Manages session lifecycle (create/start/pause/resume/end), processes user transcripts, triggers agent responses, creates checkpoints, runs coaching, and coordinates STT/TTS. Passes mode-based routing config to STT calls (`model_size`, `beam_size`) and TTS calls (`speed`) via `route_mode()`. All session mutations go through here. `finalize_user_transcript()` accepts an optional `on_progress` callback for broadcasting status updates. Semantic analysis runs separately via `run_background_analysis()` (called as an `asyncio.create_task` from `main.py`) so agent responses are not blocked by it.
 - **`schemas.py`** — All Pydantic models. Uses camelCase aliases (`Field(alias="sessionId")`) with `populate_by_name=True` so both snake_case and camelCase work.
 - **`config.py`** — Frozen `Settings` dataclass reading all configuration from env vars.
 
 #### AI Agents & LLM
 - **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`.
 - **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured.
-- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, and coaching depth. Models configurable via env vars.
+- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), and TTS speed (`tts_speed`). Models configurable via env vars.
 - **`personas.py`** — 9 built-in negotiation partner persona templates (e.g., aggressive, collaborative) plus custom.
 
 #### Analysis & Coaching
@@ -64,8 +64,8 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 - **`document_ingestion.py`** — Deterministic chunking + embeddings for uploaded documents; enables RAG in coaching.
 
 #### Speech Services
-- **`stt_service.py`** — Server-side speech-to-text via Faster-Whisper. Lazy-loaded, with per-session audio buffering and VAD. Disabled when `STT_ENABLED=false` (clients fall back to browser SpeechRecognition).
-- **`tts_service.py`** — Server-side text-to-speech via Kokoro-82M. Lazy-loaded, sentence-level streaming of PCM audio. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis).
+- **`stt_service.py`** — Server-side speech-to-text via Faster-Whisper. Mode-aware: caches multiple Whisper model sizes (e.g., `tiny` for fast mode, `small` for balanced/quality) in `self._models` dict, keyed by model size string. `beam_size` is also per-mode (1 for fast, 3 for others). Both params are passed from the orchestrator via `route_mode()`. Lazy-loaded, with per-session audio buffering and VAD. Disabled when `STT_ENABLED=false` (clients fall back to browser SpeechRecognition).
+- **`tts_service.py`** — Server-side text-to-speech via Kokoro-82M. Uses true sentence-level streaming: a background thread synthesizes via Kokoro and pushes each sentence's PCM audio into a `queue.Queue`; the async generator yields chunks as soon as they arrive (no batching). Accepts a `speed` parameter (1.2x for fast mode, 1.0 for others), routed from the orchestrator. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis).
 - **`voice_map.py`** — Kokoro voicepack mapping and selectable voice list (served via `GET /voices`).
 
 #### Storage & Infrastructure
@@ -130,6 +130,21 @@ Vite + React 18 with React Router 7, Tailwind CSS v4, shadcn/ui (Radix primitive
 - **`speech.ts`** — `createPcmMicCapture()` (16kHz mono PCM), `createSpeechRecognition()` (browser STT), `speakWithBrowserVoice()` (browser TTS with voice matching), `createServerAudioPlayer()` (Web Audio API PCM playback for server TTS).
 - **`storage.ts`** — LocalStorage helpers for setup drafts and active session snapshots.
 
+## Mode Routing Summary
+
+All mode-dependent behavior is centralized in `model_router.py:route_mode()`. The orchestrator calls this with the session's mode and threads the config to each subsystem.
+
+| Parameter | fast | balanced | quality |
+|-----------|------|----------|---------|
+| **LLM model** | gpt-5.4-nano | gpt-5.4-mini | gpt-5.4-pro |
+| **Context window** (turns) | 4 | 6 | 10 |
+| **Agent temperature** | 0.3 | 0.3 | 0.5 |
+| **Analysis passes** | 2 | 2 | 3 (+ validation) |
+| **STT model** | tiny | small | small |
+| **STT beam_size** | 1 | 3 | 3 |
+| **TTS speed** | 1.2 | 1.0 | 1.0 |
+| **Coaching depth** | 1 | 2 | 3 |
+
 ## Key Conventions
 
 - Pydantic models use camelCase aliases for JSON serialization and snake_case for Python access.
@@ -173,6 +188,8 @@ Browser fires `isFinal` (~500ms silence) → text pushed to `finalizedBufferRef`
 2. `await practice_agent.generate()` — LLM call (2-10s), the main latency source
 3. Record agent turn, run heuristic key moment detection, create checkpoint, save
 4. Return result → `main.py` broadcasts `agent.response.text` + TTS audio immediately
+
+TTS uses true sentence-level streaming: `tts_service.py` runs Kokoro synthesis in a background thread that pushes each sentence's PCM audio into a `queue.Queue`. The async generator in `synthesize()` polls the queue and yields chunks immediately — `main.py`'s broadcast loop sends each chunk to the client as it arrives. The frontend's `createServerAudioPlayer` plays chunks immediately via `feedChunk()`, so the user hears the first sentence while the rest are still synthesizing.
 
 Semantic analysis (`analysis_orchestrator.py`) runs as `asyncio.create_task(_run_and_broadcast_analysis(...))` after the agent response is already streaming to the client. It broadcasts `session.key_moment.created` events when complete. This decoupling means the user hears the agent ~2-10s sooner than if analysis blocked the response.
 

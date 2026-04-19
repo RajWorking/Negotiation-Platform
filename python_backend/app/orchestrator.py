@@ -177,10 +177,14 @@ class SessionOrchestrator:
         transcription = None
 
         if self.stt_service and encoded:
+            session = await self._require_session(session_id)
+            routing = route_mode(session.config.mode)
             audio_bytes = base64.b64decode(encoded)
             is_raw_pcm = audio_format == "pcm_s16le"
             transcription = await self.stt_service.transcribe_chunk(
-                session_id, audio_bytes, is_raw_pcm=is_raw_pcm
+                session_id, audio_bytes, is_raw_pcm=is_raw_pcm,
+                model_size=routing["stt_model_size"],
+                beam_size=routing["stt_beam_size"],
             )
 
         return {"live_state": live_state, "transcription": transcription}
@@ -189,7 +193,13 @@ class SessionOrchestrator:
         """Force-finalize any buffered STT audio for the session."""
         if not self.stt_service:
             return None
-        return await self.stt_service.finalize_session_audio(session_id)
+        session = await self._require_session(session_id)
+        routing = route_mode(session.config.mode)
+        return await self.stt_service.finalize_session_audio(
+            session_id,
+            model_size=routing["stt_model_size"],
+            beam_size=routing["stt_beam_size"],
+        )
 
     async def synthesize_agent_speech(
         self, session_id: str, text: str
@@ -201,9 +211,10 @@ class SessionOrchestrator:
         from .voice_map import resolve_voice
 
         session = await self._require_session(session_id)
+        routing = route_mode(session.config.mode)
         voice_id = resolve_voice(session.config.voice_profile)
 
-        async for chunk in self.tts_service.synthesize(text, voice_id):
+        async for chunk in self.tts_service.synthesize(text, voice_id, speed=routing["tts_speed"]):
             yield chunk
 
     def reset_stt_session(self, session_id: str) -> None:

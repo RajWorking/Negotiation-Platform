@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 from typing import AsyncGenerator, Optional
 
 import numpy as np
@@ -54,45 +55,45 @@ class TTSService:
             logger.info("Loaded Kokoro pipeline for lang=%s", lang_code)
         return self._pipelines[lang_code]
 
-    def _synthesize_sync(self, text: str, voice_id: str) -> list[bytes]:
-        """Run Kokoro synthesis (blocking). Returns list of PCM chunks."""
-        lang_code = lang_code_for_voice(voice_id)
-        pipeline = self._get_pipeline(lang_code)
+    def _synthesize_to_queue(
+        self, text: str, voice_id: str, speed: float, q: queue.Queue
+    ) -> None:
+        """Run Kokoro synthesis (blocking), pushing each sentence's audio to *q*."""
+        try:
+            lang_code = lang_code_for_voice(voice_id)
+            pipeline = self._get_pipeline(lang_code)
 
-        chunks: list[bytes] = []
-        for _graphemes, _phonemes, audio in pipeline(text, voice=voice_id, speed=1.0):
-            # audio may be a torch Tensor or numpy array depending on Kokoro version
-            if hasattr(audio, 'numpy'):
-                audio = audio.numpy()
-            audio_np = np.asarray(audio, dtype=np.float32)
-            pcm_int16 = (audio_np * 32767).astype(np.int16)
-            chunks.append(pcm_int16.tobytes())
+            for _graphemes, _phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
+                if hasattr(audio, 'numpy'):
+                    audio = audio.numpy()
+                audio_np = np.asarray(audio, dtype=np.float32)
+                pcm_int16 = (audio_np * 32767).astype(np.int16)
+                q.put(pcm_int16.tobytes())
+        except Exception as exc:
+            logger.warning("TTS synthesis failed for voice=%s: %s", voice_id, exc)
+        finally:
+            q.put(None)
 
-        return chunks
-
-    async def synthesize(self, text: str, voice_id: str) -> AsyncGenerator[bytes, None]:
+    async def synthesize(
+        self, text: str, voice_id: str, speed: float = 1.0
+    ) -> AsyncGenerator[bytes, None]:
         """Stream PCM audio chunks for the given text.
 
         Yields int16 PCM bytes at 24kHz, one chunk per sentence.
+        Each sentence is yielded as soon as it's synthesized.
         """
         self._ensure_model()
         if not self._available:
             return
 
         voice_id = voice_id or DEFAULT_VOICE
+        q: queue.Queue = queue.Queue()
 
-        try:
-            chunks = await asyncio.to_thread(self._synthesize_sync, text, voice_id)
-            for chunk in chunks:
-                yield chunk
-        except Exception as exc:
-            logger.warning("TTS synthesis failed for voice=%s: %s", voice_id, exc)
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self._synthesize_to_queue, text, voice_id, speed, q)
 
-    async def synthesize_full(self, text: str, voice_id: str) -> Optional[bytes]:
-        """Synthesize complete audio and return as a single PCM buffer."""
-        all_chunks: list[bytes] = []
-        async for chunk in self.synthesize(text, voice_id):
-            all_chunks.append(chunk)
-        if not all_chunks:
-            return None
-        return b"".join(all_chunks)
+        while True:
+            chunk = await asyncio.to_thread(q.get)
+            if chunk is None:
+                break
+            yield chunk

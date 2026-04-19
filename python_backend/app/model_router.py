@@ -13,6 +13,9 @@ def route_mode(mode: Mode) -> dict[str, object]:
             "response_style": "concise",
             "coaching_depth": 1,
             "chat_model": settings.llm_model_fast,
+            "stt_model_size": "tiny",
+            "stt_beam_size": 1,
+            "tts_speed": 1.2,
         }
     if mode == "quality":
         return {
@@ -21,6 +24,9 @@ def route_mode(mode: Mode) -> dict[str, object]:
             "response_style": "strategic",
             "coaching_depth": 3,
             "chat_model": settings.llm_model_quality,
+            "stt_model_size": settings.stt_model_size,
+            "stt_beam_size": 3,
+            "tts_speed": 1.0,
         }
     return {
         "mode": "balanced",
@@ -28,4 +34,7 @@ def route_mode(mode: Mode) -> dict[str, object]:
         "response_style": "balanced",
         "coaching_depth": 2,
         "chat_model": settings.llm_model_balanced,
+        "stt_model_size": settings.stt_model_size,
+        "stt_beam_size": 3,
+        "tts_speed": 1.0,
     }
