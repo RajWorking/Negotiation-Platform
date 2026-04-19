@@ -54,9 +54,10 @@ class Settings:
     stt_device: str = os.getenv("STT_DEVICE", "auto")
     stt_compute_type: str = os.getenv("STT_COMPUTE_TYPE", "auto")
 
-    # --- TTS (Kokoro) ---
+    # --- TTS (Kokoro + Piper) ---
     tts_enabled: bool = os.getenv("TTS_ENABLED", "true").lower() == "true"
     tts_device: str = os.getenv("TTS_DEVICE", "auto")
+    piper_voices_dir: Path = Path(os.getenv("PIPER_VOICES_DIR", str(Path(__file__).resolve().parents[1] / "data" / "piper_voices")))
 
 
 def _sync_hf_key() -> None:

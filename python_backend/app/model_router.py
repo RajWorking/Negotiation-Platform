@@ -16,6 +16,7 @@ def route_mode(mode: Mode) -> dict[str, object]:
             "stt_model_size": "tiny",
             "stt_beam_size": 1,
             "tts_speed": 1.2,
+            "tts_engine": "piper",
         }
     if mode == "quality":
         return {
@@ -27,6 +28,7 @@ def route_mode(mode: Mode) -> dict[str, object]:
             "stt_model_size": settings.stt_model_size,
             "stt_beam_size": 3,
             "tts_speed": 1.0,
+            "tts_engine": "kokoro",
         }
     return {
         "mode": "balanced",
@@ -37,4 +39,5 @@ def route_mode(mode: Mode) -> dict[str, object]:
         "stt_model_size": settings.stt_model_size,
         "stt_beam_size": 3,
         "tts_speed": 1.0,
+        "tts_engine": "kokoro",
     }

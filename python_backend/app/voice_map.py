@@ -97,3 +97,38 @@ def lang_code_for_voice(voice_id: str) -> str:
     if voice_id.startswith("b"):
         return "b"
     return "a"
+
+
+# ---------------------------------------------------------------------------
+# Piper voice mapping (used in fast mode)
+# ---------------------------------------------------------------------------
+PIPER_VOICE_MAP: dict[str, str] = {
+    # American female → en_US-amy-medium
+    "af_bella": "en_US-amy-medium",
+    "af_sarah": "en_US-amy-medium",
+    "af_heart": "en_US-amy-medium",
+    "af_nicole": "en_US-amy-medium",
+    "af_nova": "en_US-amy-medium",
+    "af_sky": "en_US-amy-medium",
+    "af_river": "en_US-amy-medium",
+    # American male → en_US-ryan-medium
+    "am_adam": "en_US-ryan-medium",
+    "am_michael": "en_US-ryan-medium",
+    "am_eric": "en_US-ryan-medium",
+    "am_liam": "en_US-ryan-medium",
+    # British female → en_GB-alba-medium
+    "bf_emma": "en_GB-alba-medium",
+    "bf_isabella": "en_GB-alba-medium",
+    "bf_alice": "en_GB-alba-medium",
+    "bf_lily": "en_GB-alba-medium",
+    # British male → en_GB-alan-medium
+    "bm_george": "en_GB-alan-medium",
+    "bm_lewis": "en_GB-alan-medium",
+    "bm_daniel": "en_GB-alan-medium",
+}
+DEFAULT_PIPER_VOICE = "en_US-amy-medium"
+
+
+def resolve_piper_voice(kokoro_voice_id: str) -> str:
+    """Map a Kokoro voice ID to the closest Piper voice name."""
+    return PIPER_VOICE_MAP.get(kokoro_voice_id, DEFAULT_PIPER_VOICE)

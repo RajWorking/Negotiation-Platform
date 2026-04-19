@@ -203,8 +203,8 @@ class SessionOrchestrator:
 
     async def synthesize_agent_speech(
         self, session_id: str, text: str
-    ) -> AsyncGenerator[bytes, None]:
-        """Synthesize agent speech using TTS. Yields PCM audio chunks."""
+    ) -> AsyncGenerator[tuple[bytes, int], None]:
+        """Synthesize agent speech using TTS. Yields (pcm_bytes, sample_rate) tuples."""
         if not self.tts_service:
             return
 
@@ -214,8 +214,10 @@ class SessionOrchestrator:
         routing = route_mode(session.config.mode)
         voice_id = resolve_voice(session.config.voice_profile)
 
-        async for chunk in self.tts_service.synthesize(text, voice_id, speed=routing["tts_speed"]):
-            yield chunk
+        async for chunk, sample_rate in self.tts_service.synthesize(
+            text, voice_id, speed=routing["tts_speed"], engine=routing["tts_engine"]
+        ):
+            yield (chunk, sample_rate)
 
     def reset_stt_session(self, session_id: str) -> None:
         """Clear STT audio buffer for a session."""

@@ -290,13 +290,13 @@ async def _broadcast_agent_result(session_id: str, result: dict[str, object]) ->
     if _tts_available():
         await _progress_cb(session_id, "synthesizing_speech")
         seq = 0
-        async for audio_chunk in orchestrator.synthesize_agent_speech(session_id, agent_turn.transcript):
+        async for audio_chunk, sample_rate in orchestrator.synthesize_agent_speech(session_id, agent_turn.transcript):
             await manager.broadcast(
                 session_id,
                 {
                     "type": "agent.response.audio.chunk", "session_id": session_id,
                     "base64": base64.b64encode(audio_chunk).decode(),
-                    "format": "pcm_s16le", "sample_rate": 24000, "sequence": seq,
+                    "format": "pcm_s16le", "sample_rate": sample_rate, "sequence": seq,
                 },
             )
             seq += 1
