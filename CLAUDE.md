@@ -36,7 +36,7 @@ cp python_backend/.env.example python_backend/.env   # LLM keys, STT/TTS, DB, Re
 cp frontend/.env.example frontend/.env               # VITE_API_BASE_URL
 ```
 
-Key env vars: `OPENAI_API_KEY` (or `HUGGINGFACE_API_KEY`, `ANTHROPIC_API_KEY`), `LLM_MODEL_FAST/BALANCED/QUALITY` (LiteLLM format), `STT_ENABLED`, `TTS_ENABLED`, `DATABASE_URL` (PostgreSQL, optional), `REDIS_URL` (optional).
+Key env vars: `OPENAI_API_KEY` (or `HUGGINGFACE_API_KEY`, `ANTHROPIC_API_KEY`), `LLM_MODEL_FAST/BALANCED/QUALITY` (LiteLLM format), `STT_ENABLED`, `TTS_ENABLED`, `PIPER_VOICES_DIR` (path to Piper ONNX voice models, default `python_backend/data/piper_voices/`), `DATABASE_URL` (PostgreSQL, optional), `REDIS_URL` (optional).
 
 ## Architecture
 
@@ -54,7 +54,7 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 #### AI Agents & LLM
 - **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`.
 - **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured.
-- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), and TTS speed (`tts_speed`). Models configurable via env vars.
+- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), TTS speed (`tts_speed`), and TTS engine (`tts_engine`: `"piper"` for fast, `"kokoro"` for balanced/quality). Models configurable via env vars.
 - **`personas.py`** — 9 built-in negotiation partner persona templates (e.g., aggressive, collaborative) plus custom.
 
 #### Analysis & Coaching
@@ -65,8 +65,8 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 
 #### Speech Services
 - **`stt_service.py`** — Server-side speech-to-text via Faster-Whisper. Mode-aware: caches multiple Whisper model sizes (e.g., `tiny` for fast mode, `small` for balanced/quality) in `self._models` dict, keyed by model size string. `beam_size` is also per-mode (1 for fast, 3 for others). Both params are passed from the orchestrator via `route_mode()`. Lazy-loaded, with per-session audio buffering and VAD. Disabled when `STT_ENABLED=false` (clients fall back to browser SpeechRecognition).
-- **`tts_service.py`** — Server-side text-to-speech via Kokoro-82M. Uses true sentence-level streaming: a background thread synthesizes via Kokoro and pushes each sentence's PCM audio into a `queue.Queue`; the async generator yields chunks as soon as they arrive (no batching). Accepts a `speed` parameter (1.2x for fast mode, 1.0 for others), routed from the orchestrator. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis).
-- **`voice_map.py`** — Kokoro voicepack mapping and selectable voice list (served via `GET /voices`).
+- **`tts_service.py`** — Server-side text-to-speech with dual-engine support: **Kokoro-82M** (24 kHz, balanced/quality modes) and **Piper TTS** (22.05 kHz, fast mode). Both engines use sentence-level streaming via `queue.Queue` in a background thread. The `synthesize()` async generator yields `(pcm_bytes, sample_rate)` tuples so callers get the correct rate per engine. Accepts `engine` parameter (`"kokoro"` or `"piper"`) and `speed` (Kokoro only). Falls back to the other engine if the requested one is unavailable. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis). Piper voice models (ONNX) live in `piper_voices_dir` (default: `python_backend/data/piper_voices/`) and are auto-downloaded on first use if missing.
+- **`voice_map.py`** — Kokoro voicepack mapping, selectable voice list (served via `GET /voices`), and a `PIPER_VOICE_MAP` dict that maps each Kokoro voice ID to its closest Piper equivalent by gender+accent. `resolve_piper_voice()` performs the mapping; users always select Kokoro voices in the UI.
 
 #### Storage & Infrastructure
 - **`storage.py`** — Dual-mode: `FileSessionStore` (dev, JSON under `python_backend/data/`) or `PostgresSessionStore` (prod, via asyncpg).
@@ -103,7 +103,7 @@ Endpoint: `/sessions/{id}/stream`
 - `agent.thinking` — Agent is generating response
 - `agent.status` — Granular processing phase updates (`{phase: "generating_response" | "synthesizing_speech"}`) shown in the UI status badge during the thinking state
 - `agent.response.text` — Agent turn with transcript and source (`llm`/`heuristic`)
-- `agent.response.audio.chunk` — PCM audio chunk (base64, pcm_s16le, 24kHz)
+- `agent.response.audio.chunk` — PCM audio chunk (base64, pcm_s16le, dynamic sample_rate: 22050 Hz for Piper/fast mode, 24000 Hz for Kokoro/balanced+quality)
 - `agent.response.audio.end` — TTS stream complete
 - `session.checkpoint.created` — New checkpoint
 - `session.key_moment.created` — Detected negotiation milestone (may arrive asynchronously after agent response, from background analysis)
@@ -142,6 +142,7 @@ All mode-dependent behavior is centralized in `model_router.py:route_mode()`. Th
 | **Analysis passes** | 2 | 2 | 3 (+ validation) |
 | **STT model** | tiny | small | small |
 | **STT beam_size** | 1 | 3 | 3 |
+| **TTS engine** | Piper (22.05 kHz) | Kokoro (24 kHz) | Kokoro (24 kHz) |
 | **TTS speed** | 1.2 | 1.0 | 1.0 |
 | **Coaching depth** | 1 | 2 | 3 |
 
@@ -189,7 +190,7 @@ Browser fires `isFinal` (~500ms silence) → text pushed to `finalizedBufferRef`
 3. Record agent turn, run heuristic key moment detection, create checkpoint, save
 4. Return result → `main.py` broadcasts `agent.response.text` + TTS audio immediately
 
-TTS uses true sentence-level streaming: `tts_service.py` runs Kokoro synthesis in a background thread that pushes each sentence's PCM audio into a `queue.Queue`. The async generator in `synthesize()` polls the queue and yields chunks immediately — `main.py`'s broadcast loop sends each chunk to the client as it arrives. The frontend's `createServerAudioPlayer` plays chunks immediately via `feedChunk()`, so the user hears the first sentence while the rest are still synthesizing.
+TTS uses true sentence-level streaming: `tts_service.py` runs synthesis (Piper in fast mode, Kokoro in balanced/quality) in a background thread that pushes each sentence's PCM audio into a `queue.Queue`. The async generator in `synthesize()` polls the queue and yields `(chunk, sample_rate)` tuples immediately — `main.py`'s broadcast loop sends each chunk with its dynamic sample rate to the client as it arrives. The frontend's `createServerAudioPlayer` plays chunks immediately via `feedChunk(base64, sampleRate)`, handling the rate difference between engines transparently.
 
 Semantic analysis (`analysis_orchestrator.py`) runs as `asyncio.create_task(_run_and_broadcast_analysis(...))` after the agent response is already streaming to the client. It broadcasts `session.key_moment.created` events when complete. This decoupling means the user hears the agent ~2-10s sooner than if analysis blocked the response.
 
