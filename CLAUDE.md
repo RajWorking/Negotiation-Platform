@@ -36,7 +36,7 @@ cp python_backend/.env.example python_backend/.env   # LLM keys, STT/TTS, DB, Re
 cp frontend/.env.example frontend/.env               # VITE_API_BASE_URL
 ```
 
-Key env vars: `OPENAI_API_KEY` (or `HUGGINGFACE_API_KEY`, `ANTHROPIC_API_KEY`), `LLM_MODEL_FAST/BALANCED/QUALITY` (LiteLLM format), `STT_ENABLED`, `TTS_ENABLED`, `PIPER_VOICES_DIR` (path to Piper ONNX voice models, default `python_backend/data/piper_voices/`), `DATABASE_URL` (PostgreSQL, optional), `REDIS_URL` (optional).
+Key env vars: `OPENAI_API_KEY` (or `HUGGINGFACE_API_KEY`, `ANTHROPIC_API_KEY`), `GEMINI_API_KEY` (enables emotion-aware Gemini TTS in quality mode), `LLM_MODEL_FAST/BALANCED/QUALITY` (LiteLLM format), `STT_ENABLED`, `TTS_ENABLED`, `PIPER_VOICES_DIR` (path to Piper ONNX voice models, default `python_backend/data/piper_voices/`), `DATABASE_URL` (PostgreSQL, optional), `REDIS_URL` (optional).
 
 ## Architecture
 
@@ -47,14 +47,14 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 **Core flow:** `main.py` → `SessionOrchestrator` → agents/services
 
 #### Session & Orchestration
-- **`orchestrator.py`** — Central coordinator. Manages session lifecycle (create/start/pause/resume/end), processes user transcripts, triggers agent responses, creates checkpoints, runs coaching, and coordinates STT/TTS. Passes mode-based routing config to STT calls (`model_size`, `beam_size`) and TTS calls (`speed`) via `route_mode()`. All session mutations go through here. `finalize_user_transcript()` accepts an optional `on_progress` callback for broadcasting status updates. Semantic analysis runs separately via `run_background_analysis()` (called as an `asyncio.create_task` from `main.py`) so agent responses are not blocked by it.
+- **`orchestrator.py`** — Central coordinator. Manages session lifecycle (create/start/pause/resume/end), processes user transcripts, triggers agent responses, creates checkpoints, runs coaching, and coordinates STT/TTS. Passes mode-based routing config to STT calls (`model_size`, `beam_size`) and TTS calls (`speed`, `engine`) via `route_mode()`. All session mutations go through here. `finalize_user_transcript()` accepts an optional `on_progress` callback for broadcasting status updates and returns both clean transcript text and raw tagged text (`agent_tts_text`) — emotion tags like `[firm]` are stripped from `ConversationTurn.transcript` but preserved in `agent_tts_text` for Gemini TTS and extracted into `ConversationTurn.emotion_tags`. Semantic analysis runs separately via `run_background_analysis()` (called as an `asyncio.create_task` from `main.py`) so agent responses are not blocked by it.
 - **`schemas.py`** — All Pydantic models. Uses camelCase aliases (`Field(alias="sessionId")`) with `populate_by_name=True` so both snake_case and camelCase work.
 - **`config.py`** — Frozen `Settings` dataclass reading all configuration from env vars.
 
 #### AI Agents & LLM
-- **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`. The `CoachingAgent` system prompt explicitly specifies the JSON schema and forbids markdown/code fences to ensure parseable output. Both agents fall back to heuristic responses when the LLM is unavailable or returns unparseable output; the heuristic coaching fallback currently uses only behavioral feature counters (not conversation turns).
-- **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. `parse_json_object` strips markdown code fences (` ```json ... ``` `) before attempting JSON extraction, since LLMs frequently wrap JSON responses in fences despite instructions not to. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured.
-- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), TTS speed (`tts_speed`), and TTS engine (`tts_engine`: `"piper"` for fast, `"kokoro"` for balanced/quality). Models configurable via env vars.
+- **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`. The `CoachingAgent` system prompt explicitly specifies the JSON schema and forbids markdown/code fences to ensure parseable output. Both agents fall back to heuristic responses when the LLM is unavailable or returns unparseable output; the heuristic coaching fallback currently uses only behavioral feature counters (not conversation turns). When `routing["tts_engine"] == "gemini"` (quality mode), the `PracticeAgent` system prompt includes instructions for inline emotion tags (`[firm]`, `[calm]`, `[excited]`, etc.) that are passed through to Gemini TTS for expressive speech synthesis.
+- **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. `parse_json_object` strips markdown code fences (` ```json ... ``` `) before attempting JSON extraction, since LLMs frequently wrap JSON responses in fences despite instructions not to. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured. `litellm.drop_params = True` is set so unsupported parameters (e.g., `temperature` on gpt-5 models) are silently dropped instead of causing errors.
+- **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), TTS speed (`tts_speed`), and TTS engine (`tts_engine`: `"piper"` for fast, `"kokoro"` for balanced, `"gemini"` for quality). Models configurable via env vars.
 - **`personas.py`** — 9 built-in negotiation partner persona templates (e.g., aggressive, collaborative) plus custom.
 
 #### Analysis & Coaching
@@ -65,8 +65,8 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 
 #### Speech Services
 - **`stt_service.py`** — Server-side speech-to-text via Faster-Whisper. Mode-aware: caches multiple Whisper model sizes (e.g., `tiny` for fast mode, `small` for balanced/quality) in `self._models` dict, keyed by model size string. `beam_size` is also per-mode (1 for fast, 3 for others). Both params are passed from the orchestrator via `route_mode()`. Lazy-loaded, with per-session audio buffering and VAD. Disabled when `STT_ENABLED=false` (clients fall back to browser SpeechRecognition).
-- **`tts_service.py`** — Server-side text-to-speech with dual-engine support: **Kokoro-82M** (24 kHz, balanced/quality modes) and **Piper TTS** (22.05 kHz, fast mode). Both engines use sentence-level streaming via `queue.Queue` in a background thread. The `synthesize()` async generator yields `(pcm_bytes, sample_rate)` tuples so callers get the correct rate per engine. Accepts `engine` parameter (`"kokoro"` or `"piper"`) and `speed` (Kokoro only). Falls back to the other engine if the requested one is unavailable. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis). Piper voice models (ONNX) live in `piper_voices_dir` (default: `python_backend/data/piper_voices/`) and are auto-downloaded on first use if missing.
-- **`voice_map.py`** — Kokoro voicepack mapping, selectable voice list (served via `GET /voices`), and a `PIPER_VOICE_MAP` dict that maps each Kokoro voice ID to its closest Piper equivalent by gender+accent. `resolve_piper_voice()` performs the mapping; users always select Kokoro voices in the UI.
+- **`tts_service.py`** — Server-side text-to-speech with tri-engine support: **Gemini TTS** (24 kHz, quality mode — emotion-aware via inline tags), **Kokoro-82M** (24 kHz, balanced mode), and **Piper TTS** (22.05 kHz, fast mode). All engines use sentence-level streaming via `queue.Queue` in a background thread. The `synthesize()` async generator yields `(pcm_bytes, sample_rate)` tuples so callers get the correct rate per engine. Accepts `engine` parameter (`"gemini"`, `"kokoro"`, or `"piper"`) and `speed` (Kokoro only). Fallback chain: `gemini → kokoro → piper`. Gemini TTS uses the native `google-genai` SDK (`genai.Client().models.generate_content()` with `response_modalities=["AUDIO"]`), NOT LiteLLM. Gemini returns full audio per call (not streamed), so text is split into sentences and each is synthesized separately to preserve the sentence-level streaming pattern. All engines are eagerly initialized at server startup to avoid blocking WebSocket connections. Disabled when `TTS_ENABLED=false` (clients fall back to browser SpeechSynthesis). Piper voice models (ONNX) live in `piper_voices_dir` (default: `python_backend/data/piper_voices/`) and are auto-downloaded on first use if missing.
+- **`voice_map.py`** — Kokoro voicepack mapping, selectable voice list (served via `GET /voices`), a `PIPER_VOICE_MAP` dict that maps each Kokoro voice ID to its closest Piper equivalent by gender+accent, and a `GEMINI_VOICE_MAP` dict that maps Kokoro voice IDs to Gemini voice names (e.g., `af_bella` → `Kore`, `am_adam` → `Charon`). `resolve_piper_voice()` and `resolve_gemini_voice()` perform the mappings; users always select Kokoro voices in the UI.
 
 #### Storage & Infrastructure
 - **`storage.py`** — Dual-mode: `FileSessionStore` (dev, JSON under `python_backend/data/`) or `PostgresSessionStore` (prod, via asyncpg).
@@ -103,7 +103,7 @@ Endpoint: `/sessions/{id}/stream`
 - `agent.thinking` — Agent is generating response
 - `agent.status` — Granular processing phase updates (`{phase: "generating_response" | "synthesizing_speech"}`) shown in the UI status badge during the thinking state
 - `agent.response.text` — Agent turn with transcript and source (`llm`/`heuristic`)
-- `agent.response.audio.chunk` — PCM audio chunk (base64, pcm_s16le, dynamic sample_rate: 22050 Hz for Piper/fast mode, 24000 Hz for Kokoro/balanced+quality)
+- `agent.response.audio.chunk` — PCM audio chunk (base64, pcm_s16le, dynamic sample_rate: 22050 Hz for Piper/fast mode, 24000 Hz for Kokoro/balanced and Gemini/quality)
 - `agent.response.audio.end` — TTS stream complete
 - `session.checkpoint.created` — New checkpoint
 - `session.key_moment.created` — Detected negotiation milestone (may arrive asynchronously after agent response, from background analysis)
@@ -136,15 +136,16 @@ All mode-dependent behavior is centralized in `model_router.py:route_mode()`. Th
 
 | Parameter | fast | balanced | quality |
 |-----------|------|----------|---------|
-| **LLM model** | gpt-5.4-nano | gpt-5.4-mini | gpt-5.4-pro |
+| **LLM model** | gpt-5.4-nano | gpt-5.4-mini | gpt-5.4-mini |
 | **Context window** (turns) | 4 | 6 | 10 |
 | **Agent temperature** | 0.3 | 0.3 | 0.5 |
 | **Analysis passes** | 2 | 2 | 3 (+ validation) |
 | **STT model** | tiny | small | small |
 | **STT beam_size** | 1 | 3 | 3 |
-| **TTS engine** | Piper (22.05 kHz) | Kokoro (24 kHz) | Kokoro (24 kHz) |
+| **TTS engine** | Piper (22.05 kHz) | Kokoro (24 kHz) | Gemini (24 kHz, emotion tags) |
 | **TTS speed** | 1.2 | 1.0 | 1.0 |
 | **Coaching depth** | 1 | 2 | 3 |
+| **Emotion tags** | No | No | Yes (`[firm]`, `[calm]`, `[excited]`, etc.) |
 
 ## Key Conventions
 
@@ -202,7 +203,7 @@ Browser fires `isFinal` (~500ms silence) → text pushed to `finalizedBufferRef`
 3. Record agent turn, run heuristic key moment detection, create checkpoint, save
 4. Return result → `main.py` broadcasts `agent.response.text` + TTS audio immediately
 
-TTS uses true sentence-level streaming: `tts_service.py` runs synthesis (Piper in fast mode, Kokoro in balanced/quality) in a background thread that pushes each sentence's PCM audio into a `queue.Queue`. The async generator in `synthesize()` polls the queue and yields `(chunk, sample_rate)` tuples immediately — `main.py`'s broadcast loop sends each chunk with its dynamic sample rate to the client as it arrives. The frontend's `createServerAudioPlayer` plays chunks immediately via `feedChunk(base64, sampleRate)`, handling the rate difference between engines transparently.
+TTS uses true sentence-level streaming: `tts_service.py` runs synthesis (Piper in fast mode, Kokoro in balanced, Gemini in quality) in a background thread that pushes each sentence's PCM audio into a `queue.Queue`. The async generator in `synthesize()` polls the queue and yields `(chunk, sample_rate)` tuples immediately — `main.py`'s broadcast loop sends each chunk with its dynamic sample rate to the client as it arrives. In quality mode, `main.py` passes `agent_tts_text` (raw text with emotion tags) to TTS instead of the clean transcript, so Gemini receives tags like `[firm]` and `[calm]` for expressive synthesis. The frontend's `createServerAudioPlayer` plays chunks immediately via `feedChunk(base64, sampleRate)`, handling the rate difference between engines transparently.
 
 Semantic analysis (`analysis_orchestrator.py`) runs as `asyncio.create_task(_run_and_broadcast_analysis(...))` after the agent response is already streaming to the client. It broadcasts `session.key_moment.created` events when complete. This decoupling means the user hears the agent ~2-10s sooner than if analysis blocked the response.
 

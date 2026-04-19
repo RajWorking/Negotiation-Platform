@@ -8,8 +8,8 @@ A voice-enabled AI roleplay coaching tool. Practice negotiation scenarios agains
 - **Pick an opponent tone**: Aggressive, dismissive, cooperative, analytical, fearful, and more (9 built-in + custom)
 - **Choose coaching focuses**: Anchoring & Numbers, Persuasion, Confidence, Emotional Control, Power Dynamics, Domain Expertise
 - **Upload reference documents**: PDFs, text files — the coaching agent uses them as evidence
-- **Select quality mode**: Fast (quick responses), Balanced (default), Quality (deeper analysis with review pass)
-- **Select a voice**: Choose from curated Kokoro TTS voices (e.g., Bella, Adam, Emma, George) with server-side synthesis
+- **Select quality mode**: Fast (quick responses), Balanced (default), Quality (deeper analysis with emotion-aware TTS)
+- **Select a voice**: Choose from curated Kokoro TTS voices (e.g., Bella, Adam, Emma, George) with server-side synthesis — in Quality mode, voices are mapped to Gemini TTS with emotion tags for expressive delivery
 - **Practice live**: Speak naturally — server-side Faster-Whisper transcribes your words and the AI responds in character
 - **Get coached**: Request on-demand coaching reports with strengths, weak signals, and a suggested next move
 - **Rewind**: Jump back to any checkpoint and try a different approach
@@ -30,7 +30,9 @@ cp python_backend/.env.example python_backend/.env
 
 Open `python_backend/.env` and add your API key. The default models use OpenAI (via the CMU AI Gateway), so set `OPENAI_API_KEY`. If you prefer Anthropic or HuggingFace, change the `LLM_MODEL_*` values and set the corresponding key instead.
 
-Without any API key, the platform still works — it falls back to rule-based heuristic responses (the UI shows an amber "Heuristic mode" badge).
+For emotion-aware TTS in Quality mode, also set `GEMINI_API_KEY`. Without it, Quality mode falls back to Kokoro TTS (no emotion tags).
+
+Without any LLM API key, the platform still works — it falls back to rule-based heuristic responses (the UI shows an amber "Heuristic mode" badge).
 
 ### Frontend
 
@@ -102,6 +104,7 @@ Without these, the backend uses file-based storage and in-process WebSocket broa
 | `STT_COMPUTE_TYPE` | No | CTranslate2 compute type (default: `auto`) |
 | `TTS_ENABLED` | No | Enable server-side TTS (default: `true`) |
 | `TTS_DEVICE` | No | TTS device: `auto`, `cpu`, or `cuda` (default: `auto`) |
+| `GEMINI_API_KEY` | No | Enables emotion-aware Gemini TTS in Quality mode |
 
 ## Tests
 
@@ -112,7 +115,7 @@ python -m unittest python_backend.tests.test_orchestrator -v
 
 ## Browser Requirements
 
-By default, transcription and voice synthesis run server-side (Faster-Whisper for STT, Kokoro for TTS). Any modern browser with microphone access works.
+By default, transcription and voice synthesis run server-side (Faster-Whisper for STT; Piper for fast mode, Kokoro for balanced, Gemini with emotion tags for quality). Any modern browser with microphone access works.
 
 If server STT/TTS is disabled, the frontend falls back to browser-native Web Speech APIs (`SpeechRecognition` for STT, `SpeechSynthesis` for TTS). Browser STT works best in Chrome and Edge.
 
