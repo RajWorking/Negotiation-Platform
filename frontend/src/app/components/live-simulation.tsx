@@ -7,6 +7,7 @@ import {
   History,
   Play,
   RotateCcw,
+  Send,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
@@ -59,6 +60,12 @@ const STATUS_LABELS: Record<SessionUiStatus, string> = {
   error: "Error",
 };
 
+const THINKING_PHASE_LABELS: Record<string, string> = {
+  "": "Thinking",
+  generating_response: "Generating response\u2026",
+  synthesizing_speech: "Converting to speech\u2026",
+};
+
 function formatTime(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
@@ -89,6 +96,7 @@ export function LiveSimulation() {
   const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
   const [currentSpeaker, setCurrentSpeaker] = useState<"user" | "ai" | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionUiStatus>("connecting");
+  const [thinkingPhase, setThinkingPhase] = useState<string>("");
   const [coachingReport, setCoachingReport] = useState<CoachingReportResponse | null>(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
@@ -113,6 +121,8 @@ export function LiveSimulation() {
   const pcmCaptureRef = useRef<PcmMicCapture | null>(null);
   const serverSTTAvailableRef = useRef(false);
   const serverTTSAvailableRef = useRef(false);
+  const finalizedBufferRef = useRef<string[]>([]);
+  const turnFinalizeTimerRef = useRef<number | null>(null);
 
   // Keep refs in sync
   useEffect(() => { showCoachingRef.current = showCoaching; }, [showCoaching]);
@@ -177,6 +187,22 @@ export function LiveSimulation() {
     }
   }, []);
 
+  const TURN_FINALIZE_DELAY_MS = 2000;
+
+  const flushTurnBuffer = useCallback(() => {
+    if (turnFinalizeTimerRef.current) {
+      window.clearTimeout(turnFinalizeTimerRef.current);
+      turnFinalizeTimerRef.current = null;
+    }
+    const buffered = finalizedBufferRef.current;
+    if (buffered.length === 0) return;
+    const fullText = buffered.join(" ").trim();
+    finalizedBufferRef.current = [];
+    if (fullText) {
+      sendRealtimeEvent({ type: "user.transcript.final", text: fullText });
+    }
+  }, [sendRealtimeEvent]);
+
   // Forward declarations for mutual references between startInputLoop / speakAgentTurn
   const startInputLoopRef = useRef<() => Promise<void>>();
   const stopInputLoopRef = useRef<() => void>();
@@ -185,6 +211,9 @@ export function LiveSimulation() {
   // Audio / speech recognition lifecycle
   // ---------------------------------------------------------------------------
   const stopInputLoop = useCallback(() => {
+    // Flush any buffered transcript before tearing down
+    flushTurnBuffer();
+
     recognitionShouldRestartRef.current = false;
     if (restartRecognitionTimeoutRef.current) {
       window.clearTimeout(restartRecognitionTimeoutRef.current);
@@ -205,7 +234,7 @@ export function LiveSimulation() {
       serverAudioPlayerRef.current.stop();
       serverAudioPlayerRef.current = null;
     }
-  }, []);
+  }, [flushTurnBuffer]);
   stopInputLoopRef.current = stopInputLoop;
 
   const startInputLoop = useCallback(async () => {
@@ -273,15 +302,24 @@ export function LiveSimulation() {
           }
         }
 
-        if (interim.trim() && !isLikelyEcho(interim.trim())) {
-          sendRealtimeEvent({ type: "user.transcript.partial", text: interim.trim() });
-        }
-
         if (finalized.length > 0) {
           const finalText = finalized.join(" ").trim();
-          if (!isLikelyEcho(finalText)) {
-            sendRealtimeEvent({ type: "user.transcript.final", text: finalText });
+          if (finalText && !isLikelyEcho(finalText)) {
+            finalizedBufferRef.current.push(finalText);
           }
+          // Reset the debounce timer — user may still be speaking
+          if (turnFinalizeTimerRef.current) {
+            window.clearTimeout(turnFinalizeTimerRef.current);
+          }
+          turnFinalizeTimerRef.current = window.setTimeout(() => {
+            flushTurnBuffer();
+          }, TURN_FINALIZE_DELAY_MS);
+        }
+
+        // Show accumulated + interim text as live partial
+        const displayText = [...finalizedBufferRef.current, interim].join(" ").trim();
+        if (displayText && !isLikelyEcho(displayText)) {
+          sendRealtimeEvent({ type: "user.transcript.partial", text: displayText });
         }
       };
 
@@ -304,7 +342,7 @@ export function LiveSimulation() {
     recognitionRef.current.start();
     setSessionStatus("listening");
     setCurrentSpeaker("user");
-  }, [sendRealtimeEvent, isLikelyEcho]);
+  }, [sendRealtimeEvent, isLikelyEcho, flushTurnBuffer, TURN_FINALIZE_DELAY_MS]);
   startInputLoopRef.current = startInputLoop;
 
   const speakAgentTurn = useCallback((text: string) => {
@@ -409,9 +447,15 @@ export function LiveSimulation() {
           case "agent.thinking":
             setCurrentSpeaker(null);
             setSessionStatus("thinking");
+            setThinkingPhase("");
+            break;
+
+          case "agent.status":
+            setThinkingPhase(String(data.phase ?? ""));
             break;
 
           case "agent.response.text":
+            setThinkingPhase("");
             if (data.turn) {
               const turn = data.turn as TranscriptTurn & { source?: ResponseSource };
               const source = turn.source ?? (data.turn as Record<string, unknown>).source as ResponseSource | undefined ?? "unknown";
@@ -549,6 +593,13 @@ export function LiveSimulation() {
   // ---------------------------------------------------------------------------
   // Actions
   // ---------------------------------------------------------------------------
+  const handleSubmitTurn = useCallback(() => {
+    flushTurnBuffer();
+    if (serverSTTAvailableRef.current) {
+      sendRealtimeEvent({ type: "user.audio.finalize" });
+    }
+  }, [flushTurnBuffer, sendRealtimeEvent]);
+
   const handlePauseForCoaching = async () => {
     if (!sessionId) return;
     setShowCoaching(true);
@@ -618,7 +669,9 @@ export function LiveSimulation() {
             {mode}
           </Badge>
           <Badge variant="outline" className="bg-teal-50 text-teal-700 border-teal-200">
-            {STATUS_LABELS[sessionStatus]}
+            {sessionStatus === "thinking"
+              ? (THINKING_PHASE_LABELS[thinkingPhase] ?? "Thinking")
+              : STATUS_LABELS[sessionStatus]}
           </Badge>
           {lastAgentSource === "heuristic" && (
             <Badge variant="outline" className="bg-amber-50 text-amber-700 border-amber-200 text-xs">
@@ -793,6 +846,15 @@ export function LiveSimulation() {
       {/* Bottom Control Bar */}
       <div className="border-t border-slate-200 px-6 py-6 bg-white/90 backdrop-blur-sm shadow-lg">
         <div className="max-w-4xl mx-auto flex items-center justify-center gap-4">
+          <Button
+            onClick={handleSubmitTurn}
+            disabled={sessionStatus !== "listening"}
+            size="lg"
+            className="bg-teal-500 hover:bg-teal-600 text-white px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transition-all disabled:opacity-50"
+          >
+            <Send className="w-5 h-5 mr-2" />
+            Done Speaking
+          </Button>
           <Button
             onClick={handlePauseForCoaching}
             size="lg"

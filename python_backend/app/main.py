@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 
@@ -62,6 +63,8 @@ manager = ConnectionManager(redis_url=settings.redis_url)
 orchestrator: SessionOrchestrator  # set in startup
 stt_service = None  # set in startup
 tts_service = None  # set in startup
+
+
 
 
 @app.on_event("startup")
@@ -255,8 +258,14 @@ def _tts_available() -> bool:
     return tts_service is not None and tts_service.available
 
 
+async def _progress_cb(session_id: str, phase: str) -> None:
+    await manager.broadcast(session_id, {
+        "type": "agent.status", "session_id": session_id, "phase": phase,
+    })
+
+
 async def _broadcast_agent_result(session_id: str, result: dict[str, object]) -> None:
-    """Broadcast agent response, TTS audio, checkpoint, and key moments."""
+    """Broadcast agent response, TTS audio, and checkpoint."""
     user_turn = result["user_turn"]
     agent_turn = result["agent_turn"]
     checkpoint = result["checkpoint"]
@@ -279,6 +288,7 @@ async def _broadcast_agent_result(session_id: str, result: dict[str, object]) ->
 
     # Stream TTS audio if available
     if _tts_available():
+        await _progress_cb(session_id, "synthesizing_speech")
         seq = 0
         async for audio_chunk in orchestrator.synthesize_agent_speech(session_id, agent_turn.transcript):
             await manager.broadcast(
@@ -306,6 +316,20 @@ async def _broadcast_agent_result(session_id: str, result: dict[str, object]) ->
             {"type": "session.key_moment.created", "session_id": session_id,
              "key_moment": _serialize_key_moment(moment)},
         )
+
+
+async def _run_and_broadcast_analysis(session_id: str) -> None:
+    """Run semantic analysis in background and broadcast results."""
+    try:
+        analysis_result = await orchestrator.run_background_analysis(session_id)
+        for moment in analysis_result.get("key_moments_created", []):
+            await manager.broadcast(
+                session_id,
+                {"type": "session.key_moment.created", "session_id": session_id,
+                 "key_moment": _serialize_key_moment(moment)},
+            )
+    except Exception:
+        logger.exception("Background analysis failed for session %s", session_id)
 
 
 @app.websocket("/sessions/{session_id}/stream")
@@ -349,8 +373,12 @@ async def stream_session(websocket: WebSocket, session_id: str) -> None:
                         )
                         orchestrator.reset_stt_session(session_id)
                         await manager.broadcast(session_id, {"type": "agent.thinking", "session_id": session_id})
-                        finalize_result = await orchestrator.finalize_user_transcript(session_id, transcription.text)
+                        finalize_result = await orchestrator.finalize_user_transcript(
+                            session_id, transcription.text,
+                            on_progress=lambda phase: _progress_cb(session_id, phase),
+                        )
                         await _broadcast_agent_result(session_id, finalize_result)
+                        asyncio.create_task(_run_and_broadcast_analysis(session_id))
                     else:
                         # Partial transcript
                         await orchestrator.set_partial_transcript(session_id, transcription.text)
@@ -371,8 +399,12 @@ async def stream_session(websocket: WebSocket, session_id: str) -> None:
                 # Browser STT fallback path — client sends final transcript directly
                 orchestrator.reset_stt_session(session_id)
                 await manager.broadcast(session_id, {"type": "agent.thinking", "session_id": session_id})
-                result = await orchestrator.finalize_user_transcript(session_id, str(event.get("text", "")))
+                result = await orchestrator.finalize_user_transcript(
+                    session_id, str(event.get("text", "")),
+                    on_progress=lambda phase: _progress_cb(session_id, phase),
+                )
                 await _broadcast_agent_result(session_id, result)
+                asyncio.create_task(_run_and_broadcast_analysis(session_id))
 
             elif event_type == "user.audio.finalize":
                 # Client requests forced finalization of buffered STT audio
@@ -383,8 +415,12 @@ async def stream_session(websocket: WebSocket, session_id: str) -> None:
                         {"type": "stt.transcript.final", "session_id": session_id, "text": transcription.text},
                     )
                     await manager.broadcast(session_id, {"type": "agent.thinking", "session_id": session_id})
-                    finalize_result = await orchestrator.finalize_user_transcript(session_id, transcription.text)
+                    finalize_result = await orchestrator.finalize_user_transcript(
+                        session_id, transcription.text,
+                        on_progress=lambda phase: _progress_cb(session_id, phase),
+                    )
                     await _broadcast_agent_result(session_id, finalize_result)
+                    asyncio.create_task(_run_and_broadcast_analysis(session_id))
 
             else:
                 await manager.broadcast(

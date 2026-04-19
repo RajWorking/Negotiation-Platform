@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 # Minimum accumulated audio (seconds) before attempting partial transcription
 _PARTIAL_INTERVAL_S = 1.0
 # Silence duration (seconds) to trigger final transcription
-_SILENCE_THRESHOLD_S = 0.6
+_SILENCE_THRESHOLD_S = 1.5
 # If transcript text is unchanged for this many consecutive checks, treat as final
-_STABLE_COUNT_FOR_FINAL = 1
+_STABLE_COUNT_FOR_FINAL = 2
 
 
 @dataclass

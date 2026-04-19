@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 from pathlib import Path
-from typing import AsyncGenerator, Optional, Union
+from typing import AsyncGenerator, Awaitable, Callable, Optional, Union
 
 from .agents import CoachingAgent, PracticeAgent
 from .analysis_orchestrator import SemanticAnalysisOrchestrator
@@ -214,7 +214,12 @@ class SessionOrchestrator:
     # ------------------------------------------------------------------
     # Turn finalization — the core loop
     # ------------------------------------------------------------------
-    async def finalize_user_transcript(self, session_id: str, text: str) -> dict[str, object]:
+    async def finalize_user_transcript(
+        self,
+        session_id: str,
+        text: str,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict[str, object]:
         session = await self._require_session(session_id)
         if session.status in {"paused", "ended"}:
             return {
@@ -223,6 +228,11 @@ class SessionOrchestrator:
             }
 
         routing = route_mode(session.config.mode)
+
+        # Merge any accumulated partial transcript the client hadn't included
+        existing_partial = (session.live_state.partial_transcript or "").strip()
+        if existing_partial and existing_partial not in text:
+            text = f"{existing_partial} {text}".strip()
 
         # Record user turn
         user_turn = ConversationTurn(
@@ -236,6 +246,11 @@ class SessionOrchestrator:
         session.features = extract_features(session.turns)
 
         # Generate agent response
+        try:
+            if on_progress:
+                await on_progress("generating_response")
+        except Exception:
+            pass
         agent_payload = await self.practice_agent.generate(
             config={
                 "situation_description": session.config.situation_description,
@@ -258,25 +273,10 @@ class SessionOrchestrator:
         session.live_state.current_speaker = "user"
         session.features = extract_features(session.turns)
 
-        # Key moment detection
-        previous_kinds = {m.kind for m in session.key_moments}
+        # Heuristic key moment detection (fast, synchronous)
         fallback_key_moments = detect_key_moments(session_id, session.turns)
-
-        semantic_result = await self.semantic_analysis_svc.analyze(
-            session_id=session_id,
-            scenario=session.config.situation_description,
-            partner_tone=session.config.partner_tone,
-            routing=routing,
-            turns=session.turns,
-            fallback_key_moments=fallback_key_moments,
-            heuristic_features=session.features.model_dump(mode="json", by_alias=False),
-        )
-        session.semantic_analysis = {
-            "signals": semantic_result.get("signals", []),
-            "summary": semantic_result.get("summary", ""),
-            "source": semantic_result.get("source", "heuristic_fallback"),
-        }
-        session.key_moments = semantic_result.get("key_moments", fallback_key_moments)
+        previous_kinds = {m.kind for m in session.key_moments}
+        session.key_moments = fallback_key_moments
         new_key_moments = [m for m in session.key_moments if m.kind not in previous_kinds]
 
         # Create checkpoint
@@ -301,6 +301,34 @@ class SessionOrchestrator:
             "checkpoint": checkpoint, "key_moments_created": new_key_moments,
             "agent_source": agent_source,
         }
+
+    async def run_background_analysis(self, session_id: str) -> dict[str, object]:
+        """Run semantic analysis in the background after agent response is sent."""
+        session = await self._require_session(session_id)
+        routing = route_mode(session.config.mode)
+
+        previous_kinds = {m.kind for m in session.key_moments}
+        fallback_key_moments = detect_key_moments(session_id, session.turns)
+
+        semantic_result = await self.semantic_analysis_svc.analyze(
+            session_id=session_id,
+            scenario=session.config.situation_description,
+            partner_tone=session.config.partner_tone,
+            routing=routing,
+            turns=session.turns,
+            fallback_key_moments=fallback_key_moments,
+            heuristic_features=session.features.model_dump(mode="json", by_alias=False),
+        )
+        session.semantic_analysis = {
+            "signals": semantic_result.get("signals", []),
+            "summary": semantic_result.get("summary", ""),
+            "source": semantic_result.get("source", "heuristic_fallback"),
+        }
+        session.key_moments = semantic_result.get("key_moments", fallback_key_moments)
+        new_key_moments = [m for m in session.key_moments if m.kind not in previous_kinds]
+
+        await self.store.save(session)
+        return {"key_moments_created": new_key_moments, "session": session}
 
     # ------------------------------------------------------------------
     # Coaching
