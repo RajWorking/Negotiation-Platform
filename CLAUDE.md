@@ -52,8 +52,8 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 - **`config.py`** — Frozen `Settings` dataclass reading all configuration from env vars.
 
 #### AI Agents & LLM
-- **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`.
-- **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured.
+- **`agents.py`** — `PracticeAgent` (generates opponent dialogue) and `CoachingAgent` (produces coaching reports with strengths/weaknesses/suggestions). Both call `LLMClient`. The `CoachingAgent` system prompt explicitly specifies the JSON schema and forbids markdown/code fences to ensure parseable output. Both agents fall back to heuristic responses when the LLM is unavailable or returns unparseable output; the heuristic coaching fallback currently uses only behavioral feature counters (not conversation turns).
+- **`llm_client.py`** — LiteLLM wrapper providing `chat_completion`, `embed`, and `parse_json_object`. `parse_json_object` strips markdown code fences (` ```json ... ``` `) before attempting JSON extraction, since LLMs frequently wrap JSON responses in fences despite instructions not to. Supports any LiteLLM provider (OpenAI, Anthropic, HuggingFace, etc.). Falls back to heuristic agents when no API keys are configured.
 - **`model_router.py`** — Maps mode (`fast`/`balanced`/`quality`) to model name, context window size, coaching depth, STT config (`stt_model_size`, `stt_beam_size`), TTS speed (`tts_speed`), and TTS engine (`tts_engine`: `"piper"` for fast, `"kokoro"` for balanced/quality). Models configurable via env vars.
 - **`personas.py`** — 9 built-in negotiation partner persona templates (e.g., aggressive, collaborative) plus custom.
 
@@ -154,12 +154,24 @@ All mode-dependent behavior is centralized in `model_router.py:route_mode()`. Th
 - LLM calls go through LiteLLM (`llm_client.py`), supporting any provider via standard env vars.
 - STT and TTS are optional server features with automatic browser fallbacks.
 - The `agents.py` module falls back to heuristic responses when no LLM API keys are available.
+- LLM JSON responses are sanitized before being passed to Pydantic models — e.g., `retrieved_evidence` items that arrive as strings (instead of `{"source", "snippet"}` dicts) are normalized in `orchestrator.py`.
+- `CoachingReport` includes a `source` field (`"llm"` or `"heuristic"`) piped from `agents.py` through `orchestrator.py` and `main.py` to the frontend, where it controls the "LLM unavailable" indicator badge.
 
 ## Development Practices
 
 - **Always use the venv**: All Python commands (tests, server, pip) must run inside `source .venv/bin/activate`.
 - **Frontend type-checking**: No standalone `tsc` binary; use `npm run build` (Vite build) to verify there are no type errors.
 - **Testing changes**: After modifying backend, run `source .venv/bin/activate && python -m unittest python_backend.tests.test_orchestrator -v`. After modifying frontend, run `cd frontend && npm run build`.
+
+### LLM JSON Integration Patterns
+
+When adding or modifying LLM calls that expect structured JSON:
+
+- **System prompts must include the exact JSON schema** with field types and example structure. Vague instructions like "return JSON with keys X, Y" lead to unparseable responses. Explicitly state "NO markdown, NO code fences, respond with ONLY the JSON object."
+- **Token budgets**: Set `max_tokens` with headroom. A JSON response with 3 arrays of 3 strings each + a paragraph string needs ~300-400 tokens; use 500 to avoid truncation. Truncated JSON silently falls back to heuristic without user-visible errors.
+- **Sanitize LLM output before Pydantic**: LLMs may return fields in unexpected formats (e.g., strings instead of dicts in an array). Normalize in the orchestrator layer before constructing Pydantic models — don't rely on the LLM matching the schema exactly.
+- **`parse_json_object()`** handles code fences and surrounding text, but test with the actual model being used — different models have different formatting tendencies.
+- **Always pipe `source` fields through**: When an agent returns `"llm"` or `"heuristic"` source indicators, ensure they survive through the Pydantic model → REST endpoint → frontend chain so the UI can display the correct provenance.
 
 ## Speech Turn Lifecycle (Critical Path)
 
