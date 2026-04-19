@@ -24,11 +24,11 @@ def route_mode(mode: Mode) -> dict[str, object]:
             "context_window": 10,
             "response_style": "strategic",
             "coaching_depth": 3,
-            "chat_model": settings.llm_model_quality,
+            "chat_model": settings.llm_model_balanced,
             "stt_model_size": settings.stt_model_size,
             "stt_beam_size": 3,
             "tts_speed": 1.0,
-            "tts_engine": "kokoro",
+            "tts_engine": "gemini",
         }
     return {
         "mode": "balanced",

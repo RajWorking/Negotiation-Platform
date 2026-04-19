@@ -9,3 +9,4 @@ faster-whisper
 kokoro>=0.9
 piper-tts
 soundfile
+google-genai>=1.0

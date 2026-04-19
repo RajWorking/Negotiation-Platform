@@ -3,25 +3,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import re
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import numpy as np
 
 from .config import settings
-from .voice_map import DEFAULT_VOICE, lang_code_for_voice, resolve_piper_voice
+from .voice_map import DEFAULT_VOICE, lang_code_for_voice, resolve_gemini_voice, resolve_piper_voice
 
 logger = logging.getLogger(__name__)
 
 KOKORO_SAMPLE_RATE = 24000
 PIPER_SAMPLE_RATE = 22050
+GEMINI_SAMPLE_RATE = 24000
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
 class TTSService:
-    """Text-to-speech service supporting Kokoro (balanced/quality) and Piper (fast).
+    """Text-to-speech service supporting Gemini (quality), Kokoro (balanced), and Piper (fast).
 
-    Lazily loads each engine on first use. Both engines stream sentence-level
-    int16 PCM audio, but at different sample rates.
+    Lazily loads each engine on first use. All engines stream sentence-level
+    int16 PCM audio at engine-specific sample rates.
     """
 
     def __init__(self, device: str = "auto") -> None:
@@ -34,6 +38,10 @@ class TTSService:
         self._piper_voices: dict[str, object] = {}  # piper_voice_name → PiperVoice
         self._piper_available = False
         self._piper_init_attempted = False
+        # Gemini state
+        self._gemini_client: object | None = None
+        self._gemini_available = False
+        self._gemini_init_attempted = False
 
     # ------------------------------------------------------------------
     # Availability
@@ -44,13 +52,19 @@ class TTSService:
             self._ensure_kokoro()
         if not self._piper_init_attempted:
             self._ensure_piper()
-        return self._kokoro_available or self._piper_available
+        if not self._gemini_init_attempted:
+            self._ensure_gemini()
+        return self._kokoro_available or self._piper_available or self._gemini_available
 
     def _engine_available(self, engine: str) -> bool:
         if engine == "piper":
             if not self._piper_init_attempted:
                 self._ensure_piper()
             return self._piper_available
+        if engine == "gemini":
+            if not self._gemini_init_attempted:
+                self._ensure_gemini()
+            return self._gemini_available
         if not self._kokoro_init_attempted:
             self._ensure_kokoro()
         return self._kokoro_available
@@ -91,6 +105,58 @@ class TTSService:
                 q.put(pcm_int16.tobytes())
         except Exception as exc:
             logger.warning("Kokoro synthesis failed for voice=%s: %s", voice_id, exc)
+        finally:
+            q.put(None)
+
+    # ------------------------------------------------------------------
+    # Gemini init & synthesis
+    # ------------------------------------------------------------------
+    def _ensure_gemini(self) -> None:
+        if self._gemini_init_attempted:
+            return
+        self._gemini_init_attempted = True
+        if not settings.gemini_api_key:
+            logger.info("GEMINI_API_KEY not set — Gemini TTS disabled")
+            return
+        try:
+            from google import genai
+            self._gemini_client = genai.Client()
+            self._gemini_available = True
+            logger.info("TTS (Gemini) available — using google-genai SDK")
+        except Exception as exc:
+            logger.warning("Failed to initialize Gemini TTS client: %s", exc)
+            self._gemini_available = False
+
+    def _synthesize_gemini_to_queue(
+        self, text: str, voice_name: str, q: queue.Queue
+    ) -> None:
+        try:
+            from google.genai import types
+
+            sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+            if not sentences:
+                sentences = [text]
+
+            for sentence in sentences:
+                response = self._gemini_client.models.generate_content(
+                    model="gemini-2.5-flash-preview-tts",
+                    contents=sentence,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=voice_name,
+                                )
+                            )
+                        ),
+                    ),
+                )
+                audio_data = response.candidates[0].content.parts[0].inline_data.data
+                if audio_data:
+                    q.put(audio_data)
+        except Exception as exc:
+            logger.warning("Gemini TTS synthesis failed for voice=%s: %s", voice_name, exc)
         finally:
             q.put(None)
 
@@ -151,7 +217,10 @@ class TTSService:
         *engine* selects "kokoro" (24 kHz) or "piper" (22.05 kHz).
         Falls back to the other engine if the requested one is unavailable.
         """
-        # Resolve engine with fallback
+        # Resolve engine with fallback chain: gemini → kokoro → piper
+        if engine == "gemini" and not self._engine_available("gemini"):
+            logger.warning("Gemini unavailable, falling back to Kokoro for this request")
+            engine = "kokoro"
         if engine == "piper" and not self._engine_available("piper"):
             logger.warning("Piper unavailable, falling back to Kokoro for this request")
             engine = "kokoro"
@@ -166,7 +235,11 @@ class TTSService:
         q: queue.Queue = queue.Queue()
         loop = asyncio.get_event_loop()
 
-        if engine == "piper":
+        if engine == "gemini":
+            gemini_voice = resolve_gemini_voice(voice_id)
+            loop.run_in_executor(None, self._synthesize_gemini_to_queue, text, gemini_voice, q)
+            sample_rate = GEMINI_SAMPLE_RATE
+        elif engine == "piper":
             piper_voice_name = resolve_piper_voice(voice_id)
             loop.run_in_executor(None, self._synthesize_piper_to_queue, text, piper_voice_name, q)
             sample_rate = PIPER_SAMPLE_RATE

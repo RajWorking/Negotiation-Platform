@@ -132,3 +132,38 @@ DEFAULT_PIPER_VOICE = "en_US-amy-medium"
 def resolve_piper_voice(kokoro_voice_id: str) -> str:
     """Map a Kokoro voice ID to the closest Piper voice name."""
     return PIPER_VOICE_MAP.get(kokoro_voice_id, DEFAULT_PIPER_VOICE)
+
+
+# ---------------------------------------------------------------------------
+# Gemini voice mapping (used in quality mode)
+# ---------------------------------------------------------------------------
+GEMINI_VOICE_MAP: dict[str, str] = {
+    # American female → Kore
+    "af_bella": "Kore",
+    "af_sarah": "Aoede",
+    "af_heart": "Leda",
+    "af_nicole": "Kore",
+    "af_nova": "Aoede",
+    "af_sky": "Leda",
+    "af_river": "Kore",
+    # American male → Charon
+    "am_adam": "Charon",
+    "am_michael": "Puck",
+    "am_eric": "Charon",
+    "am_liam": "Puck",
+    # British female → Aoede
+    "bf_emma": "Aoede",
+    "bf_isabella": "Leda",
+    "bf_alice": "Aoede",
+    "bf_lily": "Leda",
+    # British male → Orus
+    "bm_george": "Orus",
+    "bm_lewis": "Orus",
+    "bm_daniel": "Puck",
+}
+DEFAULT_GEMINI_VOICE = "Kore"
+
+
+def resolve_gemini_voice(kokoro_voice_id: str) -> str:
+    """Map a Kokoro voice ID to the closest Gemini voice name."""
+    return GEMINI_VOICE_MAP.get(kokoro_voice_id, DEFAULT_GEMINI_VOICE)

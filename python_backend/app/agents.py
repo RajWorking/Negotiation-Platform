@@ -132,6 +132,18 @@ class PracticeAgent:
             for turn in turns[-min(len(turns), context_window):]
         )
 
+        tts_emotion_instruction = ""
+        if routing.get("tts_engine") == "gemini":
+            tts_emotion_instruction = (
+                " Your reply_text will be synthesized with emotion-aware TTS. "
+                "Embed emotion tags in reply_text to control vocal delivery. "
+                "Available tags: [excited], [serious], [whispers], [calm], [firm], "
+                "[curious], [sighs], [laughs], [sarcastic], [panicked], [trembling]. "
+                "Place a tag before the phrase it applies to. Example: "
+                '"[firm] I will not go below fifty thousand. [calm] But I am open to discussing the timeline." '
+                "Use one or two tags per response. Do not use tags that do not match the negotiation context."
+            )
+
         messages = [
             {
                 "role": "system",
@@ -145,6 +157,7 @@ class PracticeAgent:
                     "avoid any markdown, bullet points, numbered lists, or special formatting, "
                     "do not use parenthetical asides or complex punctuation like semicolons, "
                     "and keep each sentence short enough to say in one breath."
+                    + tts_emotion_instruction
                 ),
             },
             {

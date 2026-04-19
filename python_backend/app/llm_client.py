@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Suppress litellm's own verbose logging — we handle warnings ourselves.
 litellm.suppress_debug_info = True
 litellm.set_verbose = False
+litellm.drop_params = True
 
 
 _LLM_KEY_ENV_VARS = [

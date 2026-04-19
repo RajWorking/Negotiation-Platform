@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Optional, Union
 
@@ -23,6 +24,8 @@ from .schemas import (
     SimulationConfig,
 )
 from .utils import ensure_dir, make_id, now_iso, summarize_text
+
+_EMOTION_TAG_RE = re.compile(r"\[[a-zA-Z_ ]+\]")
 
 logger = logging.getLogger(__name__)
 
@@ -274,10 +277,16 @@ class SessionOrchestrator:
         )
         agent_source = agent_payload.get("source", "unknown")
 
+        raw_reply = str(agent_payload["reply_text"])
+        clean_reply = _EMOTION_TAG_RE.sub("", raw_reply).strip()
+        clean_reply = re.sub(r"  +", " ", clean_reply)
+        inline_tags = _EMOTION_TAG_RE.findall(raw_reply)
+        emotion_tags = [t.strip("[]") for t in inline_tags] or list(agent_payload.get("emotion_tags", []))
+
         agent_turn = ConversationTurn(
             turnId=make_id("turn"), sessionId=session_id,
-            speaker="agent", transcript=str(agent_payload["reply_text"]),
-            emotionTags=list(agent_payload.get("emotion_tags", [])),
+            speaker="agent", transcript=clean_reply,
+            emotionTags=emotion_tags,
             startedAt=now_iso(), endedAt=now_iso(),
             metadata={"intent": agent_payload.get("intent"), "source": agent_source},
         )
@@ -313,6 +322,7 @@ class SessionOrchestrator:
             "session": session, "user_turn": user_turn, "agent_turn": agent_turn,
             "checkpoint": checkpoint, "key_moments_created": new_key_moments,
             "agent_source": agent_source,
+            "agent_tts_text": raw_reply,
         }
 
     async def run_background_analysis(self, session_id: str) -> dict[str, object]:
