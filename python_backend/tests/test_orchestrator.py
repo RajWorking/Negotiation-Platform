@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,39 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Return only JSON", payload["reply_text"])
         self.assertNotIn("Push back where needed, but remain fair", payload["reply_text"])
         self.assertNotIn("I hear your point.", payload["reply_text"])
+
+    async def test_coaching_retrieves_uploaded_document_snippet(self) -> None:
+        session = await self.orchestrator.create_session(
+            CreateSessionRequest(
+                situation_description="Negotiate a salary offer",
+                partner_tone="analytical",
+                voice_profile=VoiceProfile(),
+                mode="balanced",
+                coaching_focuses=[],
+            )
+        )
+        await self.orchestrator.start(session.session_id)
+
+        doc_text = (
+            "Base salary research notes: the target compensation is $175,000 "
+            "with a 15 percent performance bonus. Market median for senior roles "
+            "at this level is documented at $168,000 per annum."
+        )
+        await self.orchestrator.upload_documents(
+            session.session_id,
+            [{"fileName": "salary_research.txt", "base64": base64.b64encode(doc_text.encode()).decode()}],
+        )
+
+        await self.orchestrator.finalize_user_transcript(
+            session.session_id,
+            "I want to discuss my compensation and the target salary number.",
+        )
+        report = await self.orchestrator.coach(session.session_id, 4)
+
+        self.assertTrue(report.retrieved_evidence, "expected at least one retrieved snippet")
+        top = report.retrieved_evidence[0]
+        self.assertEqual(top["source"], "salary_research.txt")
+        self.assertIn("175,000", top["snippet"])
 
     async def test_llm_analysis_orchestrator_can_produce_semantic_moments(self) -> None:
         class FakeSemanticLLMClient:

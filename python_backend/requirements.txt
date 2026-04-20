@@ -10,3 +10,6 @@ kokoro>=0.9
 piper-tts
 soundfile
 google-genai>=1.0
+pypdf
+python-docx
+sentence-transformers

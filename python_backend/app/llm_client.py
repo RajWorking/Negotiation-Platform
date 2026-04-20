@@ -36,11 +36,24 @@ class LLMClient:
 
     def __init__(self, embedding_model: str = "") -> None:
         self.embedding_model = embedding_model
+        self._local_embedder = None  # lazy-loaded sentence-transformers model
 
     @property
     def is_available(self) -> bool:
         """True if at least one LLM API key is configured."""
         return any(os.getenv(var) for var in _LLM_KEY_ENV_VARS)
+
+    @property
+    def _is_local_embedding(self) -> bool:
+        return self.embedding_model.startswith("local/")
+
+    def _ensure_local_embedder(self):
+        if self._local_embedder is None:
+            from sentence_transformers import SentenceTransformer
+            model_name = self.embedding_model[len("local/"):]
+            logger.info("Loading local embedding model: %s", model_name)
+            self._local_embedder = SentenceTransformer(model_name)
+        return self._local_embedder
 
     async def chat_completion(
         self,
@@ -77,11 +90,30 @@ class LLMClient:
             return None
 
     async def embed(self, texts: list[str]) -> Optional[list[list[float]]]:
-        """Generate embeddings for a batch of texts. Returns None on failure."""
-        if not self.is_available or not self.embedding_model:
+        """Generate embeddings for a batch of texts. Returns None on failure.
+
+        When `embedding_model` starts with `local/`, uses sentence-transformers
+        in-process (no API call, no key required). Otherwise routes through LiteLLM.
+        """
+        if not self.embedding_model:
             return None
         if not texts:
             return []
+
+        if self._is_local_embedding:
+            try:
+                import asyncio
+                model = self._ensure_local_embedder()
+                vectors = await asyncio.to_thread(
+                    model.encode, texts, convert_to_numpy=True, show_progress_bar=False
+                )
+                return [v.tolist() for v in vectors]
+            except Exception as exc:
+                logger.warning("Local embedding failed (model=%s): %s", self.embedding_model, exc)
+                return None
+
+        if not self.is_available:
+            return None
 
         try:
             response = await litellm.aembedding(

@@ -26,11 +26,44 @@ from .schemas import (
 from .utils import ensure_dir, make_id, now_iso, summarize_text
 
 _EMOTION_TAG_RE = re.compile(r"\[[a-zA-Z_ ]+\]")
+_RETRIEVAL_QUERY_CHAR_BUDGET = 3500
 
 logger = logging.getLogger(__name__)
 
 # Type alias — works with both FileSessionStore and PostgresSessionStore
 SessionStore = object  # duck-typed: must have async get() and save()
+
+
+def _build_retrieval_query(session: SessionState) -> str:
+    """Compose a retrieval query from scenario, semantic summary, and conversation turns.
+
+    Full conversation is preferred over recent-only so the query reflects the whole
+    negotiation arc. Truncates from the oldest turns when the char budget is exceeded,
+    keeping recent turns intact since they carry the most immediate coaching signal.
+    """
+    parts: list[str] = [f"Scenario: {session.config.situation_description}"]
+
+    summary = (session.semantic_analysis or {}).get("summary") if session.semantic_analysis else None
+    if summary and isinstance(summary, str) and summary.strip():
+        parts.append(f"Conversation summary: {summary.strip()}")
+
+    turn_lines = [f"{t.speaker}: {t.transcript}" for t in session.turns if t.transcript]
+    if not turn_lines:
+        return "\n".join(parts)
+
+    header_len = sum(len(p) + 1 for p in parts) + len("Conversation:\n")
+    remaining = max(0, _RETRIEVAL_QUERY_CHAR_BUDGET - header_len)
+    kept: list[str] = []
+    for line in reversed(turn_lines):  # prefer recent turns if we must drop any
+        cost = len(line) + 1
+        if cost > remaining and kept:
+            break
+        remaining -= cost
+        kept.append(line)
+    kept.reverse()
+
+    parts.append("Conversation:\n" + "\n".join(kept))
+    return "\n".join(parts)
 
 
 class SessionOrchestrator:
@@ -361,13 +394,9 @@ class SessionOrchestrator:
         routing = route_mode(session.config.mode)
         recent_turns = session.turns[-max(2, window_turns):]
 
-        retrieved = self.document_service.retrieve(
+        retrieved = await self.document_service.retrieve_async(
             session.document_chunks,
-            " ".join([
-                session.config.situation_description,
-                " ".join(t.transcript for t in recent_turns),
-                f"apologies {session.features.apology_frequency} anchors {session.features.anchoring_attempts}",
-            ]),
+            _build_retrieval_query(session),
         )
 
         payload = await self.coaching_agent.generate(

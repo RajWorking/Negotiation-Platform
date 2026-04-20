@@ -445,6 +445,7 @@ export function LiveSimulation() {
             break;
 
           case "agent.thinking":
+            stopInputLoopRef.current?.();
             setCurrentSpeaker(null);
             setSessionStatus("thinking");
             setThinkingPhase("");
@@ -900,7 +901,7 @@ export function LiveSimulation() {
                 )}
               </div>
 
-              <ScrollArea className="flex-1 p-6">
+              <ScrollArea className="flex-1 min-h-0 p-6">
                 {coachingLoading ? (
                   <div className="text-sm text-teal-200">Analyzing recent turns and guidance materials...</div>
                 ) : coachingReport ? (

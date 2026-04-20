@@ -33,7 +33,7 @@ class Settings:
     llm_model_fast: str = os.getenv("LLM_MODEL_FAST", "openai/gpt-5.4-nano")
     llm_model_balanced: str = os.getenv("LLM_MODEL_BALANCED", "openai/gpt-5.4-mini")
     llm_model_quality: str = os.getenv("LLM_MODEL_QUALITY", "openai/gpt-5.4-pro")
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "local/all-MiniLM-L6-v2")
 
     # --- Auth (optional API key — if set, all endpoints require X-API-Key) ---
     api_key: Optional[str] = os.getenv("API_KEY")

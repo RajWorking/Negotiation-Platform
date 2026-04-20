@@ -61,7 +61,7 @@ FastAPI app (`main.py`) with REST endpoints, a WebSocket for live sessions, and 
 - **`analysis_orchestrator.py`** — Multi-pass semantic analysis: signal extraction → key moment selection → (quality mode) review pass. LLM-driven with heuristic fallback.
 - **`feature_extraction.py`** — Extracts behavioral features (apologies, anchoring, concessions, confidence cues) from conversation turns.
 - **`key_moment_detector.py`** — Heuristic detection of negotiation milestones (first anchor, pushback, concession, escalation, agreement shift).
-- **`document_ingestion.py`** — Deterministic chunking + embeddings for uploaded documents; enables RAG in coaching.
+- **`document_ingestion.py`** — Upload parsing (PDF via `pypdf`, DOCX via `python-docx`, plain text otherwise), deterministic chunking, and embeddings for uploaded documents. Two retrieval paths: `retrieve()` (sync, hashed-only — fallback/tests) and `retrieve_async()` (embeds the query with the real LLM model when chunks were embedded with it, otherwise hashed). Coaching uses `retrieve_async()`. Documents feed the `CoachingAgent` only — the live `PracticeAgent` does not see them by design.
 
 #### Speech Services
 - **`stt_service.py`** — Server-side speech-to-text via Faster-Whisper. Mode-aware: caches multiple Whisper model sizes (e.g., `tiny` for fast mode, `small` for balanced/quality) in `self._models` dict, keyed by model size string. `beam_size` is also per-mode (1 for fast, 3 for others). Both params are passed from the orchestrator via `route_mode()`. Lazy-loaded, with per-session audio buffering and VAD. Disabled when `STT_ENABLED=false` (clients fall back to browser SpeechRecognition).

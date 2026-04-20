@@ -7,7 +7,7 @@ A voice-enabled AI roleplay coaching tool. Practice negotiation scenarios agains
 - **Set up a scenario**: Describe any negotiation situation in plain text
 - **Pick an opponent tone**: Aggressive, dismissive, cooperative, analytical, fearful, and more (9 built-in + custom)
 - **Choose coaching focuses**: Anchoring & Numbers, Persuasion, Confidence, Emotional Control, Power Dynamics, Domain Expertise
-- **Upload reference documents**: PDFs, text files — the coaching agent uses them as evidence
+- **Upload reference documents**: PDFs, DOCX, and text files — the coaching agent uses them as evidence (the live opponent never sees them, so the roleplay stays authentic)
 - **Select quality mode**: Fast (quick responses), Balanced (default), Quality (deeper analysis with emotion-aware TTS)
 - **Select a voice**: Choose from curated Kokoro TTS voices (e.g., Bella, Adam, Emma, George) with server-side synthesis — in Quality mode, voices are mapped to Gemini TTS with emotion tags for expressive delivery
 - **Practice live**: Speak naturally — server-side Faster-Whisper transcribes your words and the AI responds in character
@@ -97,7 +97,7 @@ Without these, the backend uses file-based storage and in-process WebSocket broa
 | `LLM_MODEL_FAST` | No | Model for fast mode (default: `openai/gpt-5.4-nano`) |
 | `LLM_MODEL_BALANCED` | No | Model for balanced mode (default: `openai/gpt-5.4-mini`) |
 | `LLM_MODEL_QUALITY` | No | Model for quality mode (default: `openai/gpt-5.4-pro`) |
-| `EMBEDDING_MODEL` | No | Embedding model for RAG (default: `openai/text-embedding-3-small`) |
+| `EMBEDDING_MODEL` | No | Embedding model for RAG (default: `local/all-MiniLM-L6-v2` — runs in-process via `sentence-transformers`, no API key needed. Use e.g. `openai/text-embedding-3-small` to route via LiteLLM instead.) |
 | `STT_ENABLED` | No | Enable server-side STT (default: `true`) |
 | `STT_MODEL_SIZE` | No | Faster-Whisper model size (default: `small`) |
 | `STT_DEVICE` | No | STT device: `auto`, `cpu`, or `cuda` (default: `auto`) |

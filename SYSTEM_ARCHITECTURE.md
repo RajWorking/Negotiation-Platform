@@ -85,7 +85,7 @@ app/
 ├── analysis_orchestrator.py   Multi-pass LLM semantic analysis (signals → moments → review)
 ├── key_moment_detector.py     Regex-based key moment detection (heuristic fallback)
 ├── feature_extraction.py      Behavioral feature extraction from user turns
-├── document_ingestion.py      RAG: upload, chunk, embed, retrieve
+├── document_ingestion.py      RAG: upload (pypdf/python-docx/txt), chunk, embed, retrieve_async (coaching-only)
 ├── personas.py                9 negotiation partner persona templates
 ├── model_router.py            Mode → model/context_window/coaching_depth routing
 ├── stt_service.py             Server-side STT via Faster-Whisper (lazy-loaded)
@@ -124,9 +124,9 @@ This is the heart of the system. Called when the frontend sends a `user.transcri
 
 Both agents follow the same pattern: LLM call → JSON parse → validate → fallback to heuristic.
 
-**PracticeAgent** — opponent roleplay. Each response includes `"source": "llm"` or `"source": "heuristic"`. Heuristic replies are intent-classified and have scenario-specific variants (salary, rent, generic). The `_is_instruction_leak()` guard catches when the model regurgitates its system prompt.
+**PracticeAgent** — opponent roleplay. The system prompt instructs the model to read the scenario and *embody* the counterparty role the user is negotiating with (e.g., "user is negotiating with a landlord" → agent IS the landlord). The selected partner tone is demoted to behavioral style guidance — it shapes HOW the agent speaks, not WHO it is. Each response includes `"source": "llm"` or `"source": "heuristic"`. Heuristic replies are intent-classified with scenario-specific variants (salary, rent, generic). The `_is_instruction_leak()` guard catches system-prompt regurgitation. **PracticeAgent never sees uploaded documents** — RAG is coaching-only by design.
 
-**CoachingAgent** — strategic feedback. Takes recent turns, behavioral features, semantic analysis, key moments, and RAG evidence. Returns `{strengths, weak_signals, suggested_next_move, retrieved_evidence}`. Heuristic fallback generates feedback from behavioral feature counts.
+**CoachingAgent** — strategic feedback. Takes recent turns, behavioral features, semantic analysis, key moments, and RAG evidence retrieved from uploaded documents. Returns `{strengths, weak_signals, suggested_next_move, retrieved_evidence}`. Heuristic fallback generates feedback from behavioral feature counts.
 
 ### Persona System
 
@@ -145,6 +145,7 @@ Tones: aggressive, dismissive, neutral, cooperative, analytical, fearful, interv
 - Checks `is_available` by scanning env vars: `HUGGINGFACE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AZURE_API_KEY`, `COHERE_API_KEY`, `REPLICATE_API_KEY`
 - Handles `AuthenticationError`, `RateLimitError`, `Timeout` specifically (logs warning, returns `None`)
 - `parse_json_object()` tolerates surrounding text in LLM output
+- `embed()` has a dual path: when `EMBEDDING_MODEL` starts with `local/`, it lazy-loads a `sentence-transformers` model in-process (no API key required — e.g. `local/all-MiniLM-L6-v2` → 384-dim vectors on CPU/MPS). Any other value routes through LiteLLM's embedding API. This lets deployments use gateways that don't permit embedding models (e.g. the CMU AI Gateway) while still getting true semantic retrieval.
 
 ### Mode Routing
 
@@ -182,11 +183,21 @@ Graceful degradation — if Redis is configured but goes down, falls back to loc
 
 ### RAG Pipeline
 
+**Scope:** Uploaded documents feed the **CoachingAgent only**. The live `PracticeAgent` opponent never sees them — this keeps the roleplay authentic (the counterparty shouldn't know your prep notes).
+
 1. **Upload** — base64 decode → save to `data/uploads/{session_id}/{filename}`
-2. **Parse** — plain text: UTF-8 decode. PDF: basic regex extraction (TODO: pdfplumber)
+2. **Parse** — by extension:
+   - `.pdf` → `pypdf.PdfReader` (page-by-page `extract_text()`)
+   - `.docx` / `.doc` → `python-docx` (`Document(...).paragraphs`)
+   - everything else → UTF-8 decode
 3. **Chunk** — 600-char chunks, 120-char overlap, max 24 chunks per file
-4. **Embed** — real embeddings via `LLMClient.embed()` (LiteLLM embedding API), fallback to deterministic hash-based 64-dim embeddings
-5. **Retrieve** — at coaching time, build query from scenario + recent turns + feature keywords, rank chunks by cosine similarity, return top-k
+4. **Embed** — `LLMClient.embed()` via the dual path above (local sentence-transformers or LiteLLM). Fallback to deterministic 128-dim hashed embeddings only when both paths fail
+5. **Retrieve (coaching)** — `retrieve_async()` is called from `orchestrator.coach()` with a query built by `_build_retrieval_query(session)`:
+   - `Scenario: <situation_description>`
+   - `Conversation summary: <semantic_analysis.summary>` (when populated by the background analysis pass)
+   - `Conversation: <all user/agent turns>` truncated to 3500 chars, oldest-first drop so the most recent exchanges always survive
+   - The query is embedded with the **same** model used for chunks (detected via chunk dimensionality — `128 or 0` → hashed, anything else → real). Top-k ranked by cosine similarity.
+   - A sync `retrieve()` is kept for legacy/hashed-only paths but is no longer used by the orchestrator.
 
 ### Server-Side STT (Faster-Whisper)
 
@@ -257,7 +268,7 @@ All require `X-API-Key` header when `API_KEY` is configured.
 | `stt.transcript.final` | `{text}` | Server STT final transcription (triggers agent response) |
 | `user.transcript.partial` | `{text}` | Relayed partial transcript (browser STT path) |
 | `user.transcript.final` | `{turn}` | User turn recorded |
-| `agent.thinking` | `{}` | Before agent generation |
+| `agent.thinking` | `{}` | Before agent generation — frontend stops the mic here so the user's voice isn't captured while the agent is preparing its reply |
 | `agent.response.text` | `{turn, source}` | Agent reply ready |
 | `agent.response.audio.chunk` | `{base64, format, sample_rate, sequence}` | Server TTS PCM audio chunk |
 | `agent.response.audio.end` | `{}` | Signals all TTS chunks sent |
@@ -321,8 +332,9 @@ POST /sessions/{id}/coach
   Get recent turns (window_turns parameter)
         │
         ▼
-  RAG retrieval
-   ├── Build query: scenario + recent transcripts + feature keywords
+  RAG retrieval (retrieve_async)
+   ├── Build query: scenario + semantic summary + full conversation (truncated to 3500 chars)
+   ├── Embed query with the same model as chunks (local sentence-transformers or LiteLLM)
    ├── Cosine similarity against document chunk embeddings
    └── Return top-k snippets
         │
@@ -342,11 +354,12 @@ POST /sessions/{id}/coach
 ## TODO — Not Yet Implemented
 
 ### Phase 2: RAG Sub-System
-- [ ] Replace basic PDF regex parser with `pdfplumber` / `PyMuPDF`
-- [ ] Support additional document formats (DOCX, PPTX, HTML)
+- [x] Replace basic PDF regex parser with `pypdf`
+- [x] Support DOCX via `python-docx`
+- [x] Async `retrieve_async()` with real embeddings for query vector (local `sentence-transformers` or LiteLLM)
+- [ ] Support additional document formats (PPTX, HTML)
 - [ ] Hybrid retrieval (BM25 + semantic)
 - [ ] Chunk deduplication and overlap-aware merging
-- [ ] Async `retrieve()` with real embeddings for query vector
 
 ### STT/TTS Enhancements
 - [x] Server-side STT via Faster-Whisper with VAD-based silence detection

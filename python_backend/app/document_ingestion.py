@@ -30,23 +30,42 @@ def _chunk_text(text: str, chunk_size: int = 600, overlap: int = 120) -> list[st
 
 
 def _extract_pdf_text(raw: bytes) -> str:
-    # TODO(phase2): Replace with pdfplumber/PyMuPDF as part of the RAG sub-system.
-    candidate = " ".join(
-        match.group(1).decode("latin1", errors="ignore")
-        for match in re.finditer(rb"\(([^()]*)\)", raw)
-    )
-    return candidate.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ").strip()
+    try:
+        from io import BytesIO
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(raw))
+        return "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception as exc:
+        logger.warning("pypdf extraction failed: %s", exc)
+        return ""
+
+
+def _extract_docx_text(raw: bytes) -> str:
+    try:
+        from io import BytesIO
+        from docx import Document
+
+        doc = Document(BytesIO(raw))
+        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip()).strip()
+    except Exception as exc:
+        logger.warning("python-docx extraction failed: %s", exc)
+        return ""
 
 
 def _parse_file(file_path: Path) -> str:
     raw = file_path.read_bytes()
-    if file_path.suffix.lower() == ".pdf":
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
         text = _extract_pdf_text(raw)
-        if not text:
-            logger.warning("PDF parsing returned empty for %s — needs proper PDF library", file_path.name)
-            return f"{file_path.name} could not be parsed into rich text."
-        return text
-    return raw.decode("utf-8", errors="ignore")
+    elif suffix in (".docx", ".doc"):
+        text = _extract_docx_text(raw)
+    else:
+        text = raw.decode("utf-8", errors="ignore")
+    if not text:
+        logger.warning("Parsing returned empty for %s", file_path.name)
+        return f"{file_path.name} could not be parsed into rich text."
+    return text
 
 
 class DocumentIngestionService:
@@ -93,25 +112,48 @@ class DocumentIngestionService:
         ]
 
     def retrieve(self, chunks: list[DocumentChunk], query: str, top_k: int = 3) -> list[dict[str, object]]:
-        """Rank chunks by cosine similarity to the query. Sync for now."""
+        """Rank chunks by cosine similarity to the query using hashed embeddings only.
+
+        Sync fallback path. Prefer `retrieve_async` which embeds the query with the
+        same real model used for chunks when available.
+        """
         if not chunks:
             return []
-        # Use hashed embedding for query since we need sync retrieval and
-        # the chunks may use hashed embeddings too. When both are real
-        # embeddings from the same model, cosine similarity still works.
-        query_embedding = hashed_embedding(query)
+        chunk_dim = len(chunks[0].embedding) if chunks[0].embedding else 128
+        query_embedding = hashed_embedding(query, dims=chunk_dim)
+        return _rank(chunks, query_embedding, top_k)
 
-        # If chunks have real embeddings (different dim), fall back gracefully
-        if chunks[0].embedding and len(chunks[0].embedding) != len(query_embedding):
-            query_embedding = hashed_embedding(query, dims=len(chunks[0].embedding))
+    async def retrieve_async(
+        self, chunks: list[DocumentChunk], query: str, top_k: int = 3
+    ) -> list[dict[str, object]]:
+        """Rank chunks using a real query embedding when chunks were embedded with a real model."""
+        if not chunks:
+            return []
+        chunk_dim = len(chunks[0].embedding) if chunks[0].embedding else 0
+        # hashed_embedding default is 128 dims; anything else came from the real embedding API
+        is_hashed_chunks = chunk_dim == 128 or chunk_dim == 0
 
-        ranked = [
-            {
-                "source": chunk.source_file_name,
-                "snippet": summarize_text(chunk.text, 220),
-                "score": cosine_similarity(query_embedding, chunk.embedding),
-            }
-            for chunk in chunks
-        ]
-        ranked.sort(key=lambda item: item["score"], reverse=True)
-        return ranked[:top_k]
+        query_embedding: list[float] | None = None
+        if not is_hashed_chunks:
+            embeddings = await self.llm.embed([query])
+            if embeddings:
+                query_embedding = embeddings[0]
+        if query_embedding is None:
+            query_embedding = hashed_embedding(query, dims=chunk_dim or 128)
+
+        return _rank(chunks, query_embedding, top_k)
+
+
+def _rank(
+    chunks: list[DocumentChunk], query_embedding: list[float], top_k: int
+) -> list[dict[str, object]]:
+    ranked = [
+        {
+            "source": chunk.source_file_name,
+            "snippet": summarize_text(chunk.text, 220),
+            "score": cosine_similarity(query_embedding, chunk.embedding),
+        }
+        for chunk in chunks
+    ]
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked[:top_k]
